@@ -1334,6 +1334,8 @@ class Application(object):
                         # unmatched optional groups correctly
                         def unquote(s):
                             if s is None: return s
+                            if settings.get("no_unescape"):
+                                return s
                             return escape.url_unescape(s, encoding=None)
                         # Pass matched groups to the handler.  Since
                         # match.groups() includes both named and unnamed groups,
