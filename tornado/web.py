@@ -1350,6 +1350,8 @@ class Application(object):
                         def unquote(s):
                             if s is None:
                                 return s
+                            if self.settings.get("no_unescape"):
+                                return s
                             return escape.url_unescape(s, encoding=None)
                         # Pass matched groups to the handler.  Since
                         # match.groups() includes both named and unnamed groups,
