@@ -733,11 +733,15 @@ class RequestHandler(object):
                 self.write(line)
             self.finish()
         else:
-            self.finish("<html><title>%(code)d: %(message)s</title>" 
-                        "<body>%(code)d: %(message)s</body></html>" % {
-                    "code": status_code,
-                    "message": httplib.responses[status_code],
-                    })
+            try:
+                self.finish("<html><title>%(code)d: %(message)s</title>" 
+                            "<body>%(code)d: %(message)s</body></html>" % {
+                        "code": status_code,
+                        "message": httplib.responses[status_code],
+                        })
+            except Exception:
+                logging.error("finish-exception status_code=%s" % status_code, exc_info=True)
+                self.finish()
 
     @property
     def locale(self):
