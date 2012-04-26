@@ -740,7 +740,7 @@ class RequestHandler(object):
                         "message": httplib.responses[status_code],
                         })
             except Exception:
-                logging.error("finish-exception status_code=%s" % status_code, exc_info=True)
+#                logging.error("finish-exception status_code=%s" % status_code, exc_info=True)
                 self.finish()
 
     @property
