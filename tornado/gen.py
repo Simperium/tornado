@@ -69,6 +69,8 @@ import operator
 import sys
 import types
 
+from tornado.concurrent import Future
+from tornado.ioloop import IOLoop
 from tornado.stack_context import ExceptionStackContext
 
 
@@ -113,13 +115,14 @@ def engine(func):
             if runner is not None:
                 return runner.handle_exception(typ, value, tb)
             return False
-        with ExceptionStackContext(handle_exception):
+        with ExceptionStackContext(handle_exception) as deactivate:
             gen = func(*args, **kwargs)
             if isinstance(gen, types.GeneratorType):
-                runner = Runner(gen)
+                runner = Runner(gen, deactivate)
                 runner.run()
                 return
             assert gen is None, gen
+            deactivate()
             # no yield, so we're done
     return wrapper
 
@@ -246,6 +249,24 @@ class Task(YieldPoint):
         return self.runner.pop_result(self.key)
 
 
+class YieldFuture(YieldPoint):
+    def __init__(self, future, io_loop=None):
+        self.future = future
+        self.io_loop = io_loop or IOLoop.current()
+
+    def start(self, runner):
+        self.runner = runner
+        self.key = object()
+        runner.register_callback(self.key)
+        self.io_loop.add_future(self.future, runner.result_callback(self.key))
+
+    def is_ready(self):
+        return self.runner.is_ready(self.key)
+
+    def get_result(self):
+        return self.runner.pop_result(self.key).result()
+
+
 class Multi(YieldPoint):
     """Runs multiple asynchronous operations in parallel.
 
@@ -285,8 +306,9 @@ class Runner(object):
 
     Maintains information about pending callbacks and their results.
     """
-    def __init__(self, gen):
+    def __init__(self, gen, deactivate_stack_context):
         self.gen = gen
+        self.deactivate_stack_context = deactivate_stack_context
         self.yield_point = _NullYieldPoint()
         self.pending_callbacks = set()
         self.results = {}
@@ -351,12 +373,17 @@ class Runner(object):
                         raise LeakedCallbackError(
                             "finished without waiting for callbacks %r" %
                             self.pending_callbacks)
+                    self.deactivate_stack_context()
+                    self.deactivate_stack_context = None
                     return
                 except Exception:
                     self.finished = True
                     raise
                 if isinstance(yielded, list):
                     yielded = Multi(yielded)
+                if isinstance(yielded, Future):
+                    # TODO: lists of futures
+                    yielded = YieldFuture(yielded)
                 if isinstance(yielded, YieldPoint):
                     self.yield_point = yielded
                     try:

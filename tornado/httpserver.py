@@ -27,14 +27,13 @@ This module also defines the `HTTPRequest` class which is exposed via
 from __future__ import absolute_import, division, with_statement
 
 import Cookie
-import logging
 import socket
 import time
-import urlparse
 
-from tornado.escape import utf8, native_str, parse_qs_bytes
+from tornado.escape import native_str, parse_qs_bytes
 from tornado import httputil
 from tornado import iostream
+from tornado.log import gen_log
 from tornado.netutil import TCPServer
 from tornado import stack_context
 from tornado.util import b, bytes_type
@@ -161,9 +160,6 @@ class HTTPConnection(object):
     def __init__(self, stream, address, request_callback, no_keep_alive=False,
                  xheaders=False):
         self.stream = stream
-        if self.stream.socket.family not in (socket.AF_INET, socket.AF_INET6):
-            # Unix (or other) socket; fake the remote address
-            address = ('0.0.0.0', 0)
         self.address = address
         self.request_callback = request_callback
         self.no_keep_alive = no_keep_alive
@@ -175,6 +171,12 @@ class HTTPConnection(object):
         self._header_callback = stack_context.wrap(self._on_headers)
         self.stream.read_until(b("\r\n\r\n"), self._header_callback)
         self._write_callback = None
+
+    def close(self):
+        self.stream.close()
+        # Remove this reference to self, which would otherwise cause a
+        # cycle and delay garbage collection of this connection.
+        self._header_callback = None
 
     def write(self, chunk, callback=None):
         """Writes a chunk of output to the stream."""
@@ -222,9 +224,15 @@ class HTTPConnection(object):
         self._request = None
         self._request_finished = False
         if disconnect:
-            self.stream.close()
+            self.close()
             return
-        self.stream.read_until(b("\r\n\r\n"), self._header_callback)
+        try:
+            # Use a try/except instead of checking stream.closed()
+            # directly, because in some cases the stream doesn't discover
+            # that it's closed until you try to read from it.
+            self.stream.read_until(b("\r\n\r\n"), self._header_callback)
+        except iostream.StreamClosedError:
+            self.close()
 
     def _on_headers(self, data):
         try:
@@ -238,9 +246,20 @@ class HTTPConnection(object):
             if not version.startswith("HTTP/"):
                 raise _BadRequestException("Malformed HTTP version in HTTP Request-Line")
             headers = httputil.HTTPHeaders.parse(data[eol:])
+
+            # HTTPRequest wants an IP, not a full socket address
+            if getattr(self.stream.socket, 'family', socket.AF_INET) in (
+                socket.AF_INET, socket.AF_INET6):
+                # Jython 2.5.2 doesn't have the socket.family attribute,
+                # so just assume IP in that case.
+                remote_ip = self.address[0]
+            else:
+                # Unix (or other) socket; fake the remote address
+                remote_ip = '0.0.0.0'
+
             self._request = HTTPRequest(
                 connection=self, method=method, uri=uri, version=version,
-                headers=headers, remote_ip=self.address[0])
+                headers=headers, remote_ip=remote_ip)
 
             content_length = headers.get("Content-Length")
             if content_length:
@@ -254,34 +273,17 @@ class HTTPConnection(object):
 
             self.request_callback(self._request)
         except _BadRequestException, e:
-            logging.info("Malformed HTTP request from %s: %s",
+            gen_log.info("Malformed HTTP request from %s: %s",
                          self.address[0], e)
-            self.stream.close()
+            self.close()
             return
 
     def _on_request_body(self, data):
         self._request.body = data
-        content_type = self._request.headers.get("Content-Type", "")
-        if self._request.method in ("POST", "PUT"):
-            if content_type.startswith("application/x-www-form-urlencoded"):
-                arguments = parse_qs_bytes(native_str(self._request.body))
-                for name, values in arguments.iteritems():
-                    values = [v for v in values if v]
-                    if values:
-                        self._request.arguments.setdefault(name, []).extend(
-                            values)
-            elif content_type.startswith("multipart/form-data"):
-                fields = content_type.split(";")
-                for field in fields:
-                    k, sep, v = field.strip().partition("=")
-                    if k == "boundary" and v:
-                        httputil.parse_multipart_form_data(
-                            utf8(v), data,
-                            self._request.arguments,
-                            self._request.files)
-                        break
-                else:
-                    logging.warning("Invalid multipart/form-data")
+        if self._request.method in ("POST", "PATCH", "PUT"):
+            httputil.parse_body_arguments(
+                self._request.headers.get("Content-Type", ""), data,
+                self._request.arguments, self._request.files)
         self.request_callback(self._request)
 
 
@@ -391,15 +393,8 @@ class HTTPRequest(object):
         self._start_time = time.time()
         self._finish_time = None
 
-        scheme, netloc, path, query, fragment = urlparse.urlsplit(native_str(uri))
-        self.path = path
-        self.query = query
-        arguments = parse_qs_bytes(query)
-        self.arguments = {}
-        for name, values in arguments.iteritems():
-            values = [v for v in values if v]
-            if values:
-                self.arguments[name] = values
+        self.path, sep, self.query = uri.partition('?')
+        self.arguments = parse_qs_bytes(self.query, keep_blank_values=True)
 
     def supports_http_1_1(self):
         """Returns True if this request supports HTTP/1.1 semantics"""
@@ -439,7 +434,7 @@ class HTTPRequest(object):
         else:
             return self._finish_time - self._start_time
 
-    def get_ssl_certificate(self):
+    def get_ssl_certificate(self, binary_form=False):
         """Returns the client's SSL certificate, if any.
 
         To use client certificates, the HTTPServer must have been constructed
@@ -452,12 +447,16 @@ class HTTPRequest(object):
                     cert_reqs=ssl.CERT_REQUIRED,
                     ca_certs="cacert.crt"))
 
-        The return value is a dictionary, see SSLSocket.getpeercert() in
-        the standard library for more details.
+        By default, the return value is a dictionary (or None, if no
+        client certificate is present).  If ``binary_form`` is true, a
+        DER-encoded form of the certificate is returned instead.  See
+        SSLSocket.getpeercert() in the standard library for more
+        details.
         http://docs.python.org/library/ssl.html#sslsocket-objects
         """
         try:
-            return self.connection.stream.socket.getpeercert()
+            return self.connection.stream.socket.getpeercert(
+                binary_form=binary_form)
         except ssl.SSLError:
             return None
 
