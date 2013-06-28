@@ -5,20 +5,25 @@ import functools
 import sys
 import textwrap
 import time
+import platform
+import weakref
 
 from tornado.concurrent import return_future
 from tornado.escape import url_escape
 from tornado.httpclient import AsyncHTTPClient
+from tornado.ioloop import IOLoop
 from tornado.log import app_log
 from tornado import stack_context
 from tornado.testing import AsyncHTTPTestCase, AsyncTestCase, ExpectLog, gen_test
 from tornado.test.util import unittest, skipOnTravis
-from tornado.web import Application, RequestHandler, asynchronous
+from tornado.web import Application, RequestHandler, asynchronous, HTTPError
 
 from tornado import gen
 
 
 skipBefore33 = unittest.skipIf(sys.version_info < (3, 3), 'PEP 380 not available')
+skipNotCPython = unittest.skipIf(platform.python_implementation() != 'CPython',
+                                 'Not CPython implementation')
 
 
 class GenEngineTest(AsyncTestCase):
@@ -341,6 +346,16 @@ class GenEngineTest(AsyncTestCase):
     def test_stack_context_leak(self):
         # regression test: repeated invocations of a gen-based
         # function should not result in accumulated stack_contexts
+        def _stack_depth():
+            head = stack_context._state.contexts[1]
+            length = 0
+
+            while head is not None:
+                length += 1
+                head = head.old_contexts[1]
+
+            return length
+
         @gen.engine
         def inner(callback):
             yield gen.Task(self.io_loop.add_callback)
@@ -350,10 +365,11 @@ class GenEngineTest(AsyncTestCase):
         def outer():
             for i in range(10):
                 yield gen.Task(inner)
-            stack_increase = len(stack_context._state.contexts) - initial_stack_depth
+
+            stack_increase = _stack_depth() - initial_stack_depth
             self.assertTrue(stack_increase <= 2)
             self.stop()
-        initial_stack_depth = len(stack_context._state.contexts)
+        initial_stack_depth = _stack_depth()
         self.run_gen(outer)
 
     def test_stack_context_leak_exception(self):
@@ -487,6 +503,25 @@ class GenEngineTest(AsyncTestCase):
 
         with self.assertRaises(gen.ReturnValueIgnoredError):
             self.run_gen(f)
+
+    @skipNotCPython
+    def test_task_refcounting(self):
+        # On CPython, tasks and their arguments should be released immediately
+        # without waiting for garbage collection.
+        @gen.engine
+        def f():
+            class Foo(object):
+                pass
+            arg = Foo()
+            self.arg_ref = weakref.ref(arg)
+            task = gen.Task(self.io_loop.add_callback, arg=arg)
+            self.task_ref = weakref.ref(task)
+            yield task
+            self.stop()
+
+        self.run_gen(f)
+        self.assertIs(self.arg_ref(), None)
+        self.assertIs(self.task_ref(), None)
 
 
 class GenCoroutineTest(AsyncTestCase):
@@ -713,7 +748,6 @@ class GenSequenceHandler(RequestHandler):
 
 
 class GenCoroutineSequenceHandler(RequestHandler):
-    @asynchronous
     @gen.coroutine
     def get(self):
         self.io_loop = self.request.connection.stream.io_loop
@@ -794,6 +828,32 @@ class GenYieldExceptionHandler(RequestHandler):
             self.finish('ok')
 
 
+class UndecoratedCoroutinesHandler(RequestHandler):
+    @gen.coroutine
+    def prepare(self):
+        self.chunks = []
+        yield gen.Task(IOLoop.current().add_callback)
+        self.chunks.append('1')
+
+    @gen.coroutine
+    def get(self):
+        self.chunks.append('2')
+        yield gen.Task(IOLoop.current().add_callback)
+        self.chunks.append('3')
+        yield gen.Task(IOLoop.current().add_callback)
+        self.write(''.join(self.chunks))
+
+
+class AsyncPrepareErrorHandler(RequestHandler):
+    @gen.coroutine
+    def prepare(self):
+        yield gen.Task(IOLoop.current().add_callback)
+        raise HTTPError(403)
+
+    def get(self):
+        self.finish('ok')
+
+
 class GenWebTest(AsyncHTTPTestCase):
     def get_app(self):
         return Application([
@@ -805,6 +865,8 @@ class GenWebTest(AsyncHTTPTestCase):
             ('/exception', GenExceptionHandler),
             ('/coroutine_exception', GenCoroutineExceptionHandler),
             ('/yield_exception', GenYieldExceptionHandler),
+            ('/undecorated_coroutine', UndecoratedCoroutinesHandler),
+            ('/async_prepare_error', AsyncPrepareErrorHandler),
         ])
 
     def test_sequence_handler(self):
@@ -838,6 +900,14 @@ class GenWebTest(AsyncHTTPTestCase):
     def test_yield_exception_handler(self):
         response = self.fetch('/yield_exception')
         self.assertEqual(response.body, b'ok')
+
+    def test_undecorated_coroutines(self):
+        response = self.fetch('/undecorated_coroutine')
+        self.assertEqual(response.body, b'123')
+
+    def test_async_prepare_error_handler(self):
+        response = self.fetch('/async_prepare_error')
+        self.assertEqual(response.code, 403)
 
 if __name__ == '__main__':
     unittest.main()

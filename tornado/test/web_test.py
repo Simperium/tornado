@@ -9,10 +9,11 @@ from tornado.template import DictLoader
 from tornado.testing import AsyncHTTPTestCase, ExpectLog
 from tornado.test.util import unittest
 from tornado.util import u, bytes_type, ObjectDict, unicode_type
-from tornado.web import RequestHandler, authenticated, Application, asynchronous, url, HTTPError, StaticFileHandler, _create_signature, create_signed_value, ErrorHandler
+from tornado.web import RequestHandler, authenticated, Application, asynchronous, url, HTTPError, StaticFileHandler, _create_signature, create_signed_value, ErrorHandler, UIModule, MissingArgumentError
 
 import binascii
 import datetime
+import email.utils
 import logging
 import os
 import re
@@ -20,6 +21,8 @@ import socket
 import sys
 
 wsgi_safe_tests = []
+
+relpath = lambda *a: os.path.join(os.path.dirname(__file__), *a)
 
 
 def wsgi_safe(cls):
@@ -187,7 +190,7 @@ class CookieTest(WebTestCase):
         data = [('foo=a=b', 'a=b'),
                 ('foo="a=b"', 'a=b'),
                 ('foo="a;b"', 'a;b'),
-                #('foo=a\\073b', 'a;b'),  # even encoded, ";" is a delimiter
+                # ('foo=a\\073b', 'a;b'),  # even encoded, ";" is a delimiter
                 ('foo="a\\073b"', 'a;b'),
                 ('foo="a\\"b"', 'a"b'),
                 ]
@@ -502,6 +505,10 @@ class WSGISafeWebTest(WebTestCase):
                     autoescape="xhtml_escape",
                     cookie_secret=self.COOKIE_SECRET)
 
+    def tearDown(self):
+        super(WSGISafeWebTest, self).tearDown()
+        RequestHandler._template_loaders.clear()
+
     def get_handlers(self):
         urls = [
             url("/typecheck/(.*)", TypeCheckHandler, name='typecheck'),
@@ -555,6 +562,18 @@ class WSGISafeWebTest(WebTestCase):
                                 u('query'): [u('bytes'), u('c3a9')],
                                 })
 
+    def test_decode_argument_plus(self):
+        # These urls are all equivalent.
+        urls = ["/decode_arg/1%20%2B%201?foo=1%20%2B%201&encoding=utf-8",
+                "/decode_arg/1%20+%201?foo=1+%2B+1&encoding=utf-8"]
+        for url in urls:
+            response = self.fetch(url)
+            response.rethrow()
+            data = json_decode(response.body)
+            self.assertEqual(data, {u('path'): [u('unicode'), u('1 + 1')],
+                                    u('query'): [u('unicode'), u('1 + 1')],
+                                    })
+
     def test_reverse_url(self):
         self.assertEqual(self.app.reverse_url('decode_arg', 'foo'),
                          '/decode_arg/foo')
@@ -564,6 +583,8 @@ class WSGISafeWebTest(WebTestCase):
                          '/decode_arg/%E9')
         self.assertEqual(self.app.reverse_url('decode_arg', u('\u00e9')),
                          '/decode_arg/%C3%A9')
+        self.assertEqual(self.app.reverse_url('decode_arg', '1 + 1'),
+                         '/decode_arg/1%20%2B%201')
 
     def test_uimodule_unescaped(self):
         response = self.fetch("/linkify")
@@ -735,16 +756,19 @@ class ErrorResponseTest(WebTestCase):
 
 @wsgi_safe
 class StaticFileTest(WebTestCase):
+    # The expected MD5 hash of robots.txt, used in tests that call
+    # StaticFileHandler.get_version
+    robots_txt_hash = b"f71d20196d4caf35b6a670db8c70b03d"
+    static_dir = os.path.join(os.path.dirname(__file__), 'static')
+
     def get_handlers(self):
         class StaticUrlHandler(RequestHandler):
             def get(self, path):
-                self.write(self.static_url(path))
+                with_v = int(self.get_argument('include_version', 1))
+                self.write(self.static_url(path, include_version=with_v))
 
-        class AbsoluteStaticUrlHandler(RequestHandler):
+        class AbsoluteStaticUrlHandler(StaticUrlHandler):
             include_host = True
-
-            def get(self, path):
-                self.write(self.static_url(path))
 
         class OverrideStaticUrlHandler(RequestHandler):
             def get(self, path):
@@ -772,8 +796,7 @@ class StaticFileTest(WebTestCase):
                 ('/override_static_url/(.*)', OverrideStaticUrlHandler)]
 
     def get_app_kwargs(self):
-        return dict(static_path=os.path.join(os.path.dirname(__file__),
-                                             'static'))
+        return dict(static_path=relpath('static'))
 
     def test_static_files(self):
         response = self.fetch('/robots.txt')
@@ -784,12 +807,25 @@ class StaticFileTest(WebTestCase):
 
     def test_static_url(self):
         response = self.fetch("/static_url/robots.txt")
-        self.assertEqual(response.body, b"/static/robots.txt?v=f71d2")
+        self.assertEqual(response.body,
+                         b"/static/robots.txt?v=" + self.robots_txt_hash)
 
     def test_absolute_static_url(self):
         response = self.fetch("/abs_static_url/robots.txt")
+        self.assertEqual(response.body, (
+            utf8(self.get_url("/")) +
+            b"static/robots.txt?v=" +
+            self.robots_txt_hash
+        ))
+
+    def test_relative_version_exclusion(self):
+        response = self.fetch("/static_url/robots.txt?include_version=0")
+        self.assertEqual(response.body, b"/static/robots.txt")
+
+    def test_absolute_version_exclusion(self):
+        response = self.fetch("/abs_static_url/robots.txt?include_version=0")
         self.assertEqual(response.body,
-                         utf8(self.get_url("/") + "static/robots.txt?v=f71d2"))
+                         utf8(self.get_url("/") + "static/robots.txt"))
 
     def test_include_host_override(self):
         self._trigger_include_host_check(False)
@@ -819,7 +855,7 @@ class StaticFileTest(WebTestCase):
         # negative values, and at least one client (processing.js) seems
         # to use if-modified-since 1/1/1960 as a cache-busting technique.
         response = self.fetch("/static/robots.txt", headers={
-                'If-Modified-Since': 'Fri, 01 Jan 1960 00:00:00 GMT'})
+            'If-Modified-Since': 'Fri, 01 Jan 1960 00:00:00 GMT'})
         self.assertEqual(response.code, 200)
 
     def test_static_if_modified_since_time_zone(self):
@@ -827,41 +863,186 @@ class StaticFileTest(WebTestCase):
         # chosen just before and after the known modification time
         # of the file to ensure that the right time zone is being used
         # when parsing If-Modified-Since.
-        stat = os.stat(os.path.join(os.path.dirname(__file__),
-                                    'static/robots.txt'))
+        stat = os.stat(relpath('static/robots.txt'))
 
         response = self.fetch('/static/robots.txt', headers={
-                'If-Modified-Since': format_timestamp(stat.st_mtime - 1)})
+            'If-Modified-Since': format_timestamp(stat.st_mtime - 1)})
         self.assertEqual(response.code, 200)
         response = self.fetch('/static/robots.txt', headers={
-                'If-Modified-Since': format_timestamp(stat.st_mtime + 1)})
+            'If-Modified-Since': format_timestamp(stat.st_mtime + 1)})
         self.assertEqual(response.code, 304)
+
+    def test_static_etag(self):
+        response = self.fetch('/static/robots.txt')
+        self.assertEqual(utf8(response.headers.get("Etag")),
+                         b'"' + self.robots_txt_hash + b'"')
+
+    def test_static_with_range(self):
+        response = self.fetch('/static/robots.txt', headers={
+            'Range': 'bytes=0-9'})
+        self.assertEqual(response.code, 206)
+        self.assertEqual(response.body, b"User-agent")
+        self.assertEqual(utf8(response.headers.get("Etag")),
+                         b'"' + self.robots_txt_hash + b'"')
+        self.assertEqual(response.headers.get("Content-Length"), "10")
+        self.assertEqual(response.headers.get("Content-Range"),
+                         "bytes 0-9/26")
+
+    def test_static_with_range_full_file(self):
+        response = self.fetch('/static/robots.txt', headers={
+            'Range': 'bytes=0-'})
+        # Note: Chrome refuses to play audio if it gets an HTTP 206 in response
+        # to ``Range: bytes=0-`` :(
+        self.assertEqual(response.code, 200)
+        robots_file_path = os.path.join(self.static_dir, "robots.txt")
+        with open(robots_file_path) as f:
+            self.assertEqual(response.body, utf8(f.read()))
+        self.assertEqual(response.headers.get("Content-Length"), "26")
+        self.assertEqual(response.headers.get("Content-Range"), None)
+
+    def test_static_with_range_end_edge(self):
+        response = self.fetch('/static/robots.txt', headers={
+            'Range': 'bytes=22-'})
+        self.assertEqual(response.body, b": /\n")
+        self.assertEqual(response.headers.get("Content-Length"), "4")
+        self.assertEqual(response.headers.get("Content-Range"),
+                         "bytes 22-25/26")
+
+    def test_static_with_range_neg_end(self):
+        response = self.fetch('/static/robots.txt', headers={
+            'Range': 'bytes=-4'})
+        self.assertEqual(response.body, b": /\n")
+        self.assertEqual(response.headers.get("Content-Length"), "4")
+        self.assertEqual(response.headers.get("Content-Range"),
+                         "bytes 22-25/26")
+
+    def test_static_invalid_range(self):
+        response = self.fetch('/static/robots.txt', headers={
+            'Range': 'asdf'})
+        self.assertEqual(response.code, 200)
+
+    def test_static_unsatisfiable_range_zero_suffix(self):
+        response = self.fetch('/static/robots.txt', headers={
+            'Range': 'bytes=-0'})
+        self.assertEqual(response.headers.get("Content-Range"),
+                         "bytes */26")
+        self.assertEqual(response.code, 416)
+
+    def test_static_unsatisfiable_range_invalid_start(self):
+        response = self.fetch('/static/robots.txt', headers={
+            'Range': 'bytes=26'})
+        self.assertEqual(response.code, 416)
+        self.assertEqual(response.headers.get("Content-Range"),
+                         "bytes */26")
+
+    def test_static_head(self):
+        response = self.fetch('/static/robots.txt', method='HEAD')
+        self.assertEqual(response.code, 200)
+        # No body was returned, but we did get the right content length.
+        self.assertEqual(response.body, b'')
+        self.assertEqual(response.headers['Content-Length'], '26')
+        self.assertEqual(utf8(response.headers['Etag']),
+                         b'"' + self.robots_txt_hash + b'"')
+
+    def test_static_head_range(self):
+        response = self.fetch('/static/robots.txt', method='HEAD',
+                              headers={'Range': 'bytes=1-4'})
+        self.assertEqual(response.code, 206)
+        self.assertEqual(response.body, b'')
+        self.assertEqual(response.headers['Content-Length'], '4')
+        self.assertEqual(utf8(response.headers['Etag']),
+                         b'"' + self.robots_txt_hash + b'"')
+
+    def test_static_range_if_none_match(self):
+        response = self.fetch('/static/robots.txt', headers={
+            'Range': 'bytes=1-4',
+            'If-None-Match': b'"' + self.robots_txt_hash + b'"'})
+        self.assertEqual(response.code, 304)
+        self.assertEqual(response.body, b'')
+        self.assertTrue('Content-Length' not in response.headers)
+        self.assertEqual(utf8(response.headers['Etag']),
+                         b'"' + self.robots_txt_hash + b'"')
+
+    def test_static_404(self):
+        response = self.fetch('/static/blarg')
+        self.assertEqual(response.code, 404)
+
+
+@wsgi_safe
+class StaticDefaultFilenameTest(WebTestCase):
+    def get_app_kwargs(self):
+        return dict(static_path=relpath('static'),
+                    static_handler_args=dict(default_filename='index.html'))
+
+    def get_handlers(self):
+        return []
+
+    def test_static_default_filename(self):
+        response = self.fetch('/static/dir/', follow_redirects=False)
+        self.assertEqual(response.code, 200)
+        self.assertEqual(b'this is the index\n', response.body)
+
+    def test_static_default_redirect(self):
+        response = self.fetch('/static/dir', follow_redirects=False)
+        self.assertEqual(response.code, 301)
+        self.assertTrue(response.headers['Location'].endswith('/static/dir/'))
+
+
+@wsgi_safe
+class StaticFileWithPathTest(WebTestCase):
+    def get_app_kwargs(self):
+        return dict(static_path=relpath('static'),
+                    static_handler_args=dict(default_filename='index.html'))
+
+    def get_handlers(self):
+        return [("/foo/(.*)", StaticFileHandler, {
+            "path": relpath("templates/"),
+        })]
+
+    def test_serve(self):
+        response = self.fetch("/foo/utf8.html")
+        self.assertEqual(response.body, b"H\xc3\xa9llo\n")
 
 
 @wsgi_safe
 class CustomStaticFileTest(WebTestCase):
     def get_handlers(self):
         class MyStaticFileHandler(StaticFileHandler):
-            def get(self, path):
-                path = self.parse_url_path(path)
-                if path != "foo.txt":
-                    raise Exception("unexpected path: %r" % path)
-                self.write("bar")
-
             @classmethod
             def make_static_url(cls, settings, path):
-                cls.get_version(settings, path)
+                version_hash = cls.get_version(settings, path)
                 extension_index = path.rindex('.')
                 before_version = path[:extension_index]
                 after_version = path[(extension_index + 1):]
-                return '/static/%s.%s.%s' % (before_version, 42, after_version)
+                return '/static/%s.%s.%s' % (before_version, version_hash,
+                                             after_version)
 
-            @classmethod
-            def parse_url_path(cls, url_path):
+            def parse_url_path(self, url_path):
                 extension_index = url_path.rindex('.')
                 version_index = url_path.rindex('.', 0, extension_index)
                 return '%s%s' % (url_path[:version_index],
                                  url_path[extension_index:])
+
+            @classmethod
+            def get_absolute_path(cls, settings, path):
+                return 'CustomStaticFileTest:' + path
+
+            def validate_absolute_path(self, root, absolute_path):
+                return absolute_path
+
+            @classmethod
+            def get_content(self, path, start=None, end=None):
+                assert start is None and end is None
+                if path == 'CustomStaticFileTest:foo.txt':
+                    return b'bar'
+                raise Exception("unexpected path %r" % path)
+
+            def get_modified_time(self):
+                return None
+
+            @classmethod
+            def get_version(cls, settings, path):
+                return "42"
 
         class StaticUrlHandler(RequestHandler):
             def get(self, path):
@@ -1009,8 +1190,8 @@ class DateHeaderTest(SimpleHandlerTestCase):
 
     def test_date_header(self):
         response = self.fetch('/')
-        header_date = datetime.datetime.strptime(response.headers['Date'],
-                                                 "%a, %d %b %Y %H:%M:%S GMT")
+        header_date = datetime.datetime(
+            *email.utils.parsedate(response.headers['Date'])[:6])
         self.assertTrue(header_date - datetime.datetime.utcnow() <
                         datetime.timedelta(seconds=2))
 
@@ -1120,3 +1301,250 @@ class ClearAllCookiesTest(SimpleHandlerTestCase):
         set_cookies = sorted(response.headers.get_list('Set-Cookie'))
         self.assertTrue(set_cookies[0].startswith('baz=;'))
         self.assertTrue(set_cookies[1].startswith('foo=;'))
+
+
+class PermissionError(Exception):
+    pass
+
+
+@wsgi_safe
+class ExceptionHandlerTest(SimpleHandlerTestCase):
+    class Handler(RequestHandler):
+        def get(self):
+            exc = self.get_argument('exc')
+            if exc == 'http':
+                raise HTTPError(410, "no longer here")
+            elif exc == 'zero':
+                1 / 0
+            elif exc == 'permission':
+                raise PermissionError('not allowed')
+
+        def write_error(self, status_code, **kwargs):
+            if 'exc_info' in kwargs:
+                typ, value, tb = kwargs['exc_info']
+                if isinstance(value, PermissionError):
+                    self.set_status(403)
+                    self.write('PermissionError')
+                    return
+            RequestHandler.write_error(self, status_code, **kwargs)
+
+        def log_exception(self, typ, value, tb):
+            if isinstance(value, PermissionError):
+                app_log.warning('custom logging for PermissionError: %s',
+                                value.args[0])
+            else:
+                RequestHandler.log_exception(self, typ, value, tb)
+
+    def test_http_error(self):
+        # HTTPErrors are logged as warnings with no stack trace.
+        # TODO: extend ExpectLog to test this more precisely
+        with ExpectLog(gen_log, '.*no longer here'):
+            response = self.fetch('/?exc=http')
+            self.assertEqual(response.code, 410)
+
+    def test_unknown_error(self):
+        # Unknown errors are logged as errors with a stack trace.
+        with ExpectLog(app_log, 'Uncaught exception'):
+            response = self.fetch('/?exc=zero')
+            self.assertEqual(response.code, 500)
+
+    def test_known_error(self):
+        # log_exception can override logging behavior, and write_error
+        # can override the response.
+        with ExpectLog(app_log,
+                       'custom logging for PermissionError: not allowed'):
+            response = self.fetch('/?exc=permission')
+            self.assertEqual(response.code, 403)
+
+
+@wsgi_safe
+class UIMethodUIModuleTest(SimpleHandlerTestCase):
+    """Test that UI methods and modules are created correctly and
+    associated with the handler.
+    """
+    class Handler(RequestHandler):
+        def get(self):
+            self.render('foo.html')
+
+        def value(self):
+            return self.get_argument("value")
+
+    def get_app_kwargs(self):
+        def my_ui_method(handler, x):
+            return "In my_ui_method(%s) with handler value %s." % (
+                x, handler.value())
+        class MyModule(UIModule):
+            def render(self, x):
+                return "In MyModule(%s) with handler value %s." % (
+                    x, self.handler.value())
+
+        loader = DictLoader({
+            'foo.html': '{{ my_ui_method(42) }} {% module MyModule(123) %}',
+        })
+        return dict(template_loader=loader,
+                    ui_methods={'my_ui_method': my_ui_method},
+                    ui_modules={'MyModule': MyModule})
+
+    def tearDown(self):
+        super(UIMethodUIModuleTest, self).tearDown()
+        # TODO: fix template loader caching so this isn't necessary.
+        RequestHandler._template_loaders.clear()
+
+    def test_ui_method(self):
+        response = self.fetch('/?value=asdf')
+        self.assertEqual(response.body,
+                         b'In my_ui_method(42) with handler value asdf. '
+                         b'In MyModule(123) with handler value asdf.')
+
+
+@wsgi_safe
+class GetArgumentErrorTest(SimpleHandlerTestCase):
+    class Handler(RequestHandler):
+        def get(self):
+            try:
+                self.get_argument('foo')
+                self.write({})
+            except MissingArgumentError as e:
+                self.write({'arg_name': e.arg_name,
+                            'log_message': e.log_message})
+
+    def test_catch_error(self):
+        response = self.fetch('/')
+        self.assertEqual(json_decode(response.body),
+                         {'arg_name': 'foo',
+                          'log_message': 'Missing argument foo'})
+
+
+class MultipleExceptionTest(SimpleHandlerTestCase):
+    class Handler(RequestHandler):
+        exc_count = 0
+
+        @asynchronous
+        def get(self):
+            from tornado.ioloop import IOLoop
+            IOLoop.current().add_callback(lambda: 1 / 0)
+            IOLoop.current().add_callback(lambda: 1 / 0)
+
+        def log_exception(self, typ, value, tb):
+            MultipleExceptionTest.Handler.exc_count += 1
+
+    def test_multi_exception(self):
+        # This test verifies that multiple exceptions raised into the same
+        # ExceptionStackContext do not generate extraneous log entries
+        # due to "Cannot send error response after headers written".
+        # log_exception is called, but it does not proceed to send_error.
+        response = self.fetch('/')
+        self.assertEqual(response.code, 500)
+        response = self.fetch('/')
+        self.assertEqual(response.code, 500)
+        # Each of our two requests generated two exceptions, we should have
+        # seen at least three of them by now (the fourth may still be
+        # in the queue).
+        self.assertGreater(MultipleExceptionTest.Handler.exc_count, 2)
+
+
+@wsgi_safe
+class SetCurrentUserTest(SimpleHandlerTestCase):
+    class Handler(RequestHandler):
+        def prepare(self):
+            self.current_user = 'Ben'
+
+        def get(self):
+            self.write('Hello %s' % self.current_user)
+
+    def test_set_current_user(self):
+        # Ensure that current_user can be assigned to normally for apps
+        # that want to forgo the lazy get_current_user property
+        response = self.fetch('/')
+        self.assertEqual(response.body, b'Hello Ben')
+
+
+@wsgi_safe
+class UnimplementedHTTPMethodsTest(SimpleHandlerTestCase):
+    class Handler(RequestHandler):
+        pass
+
+    def test_unimplemented_standard_methods(self):
+        for method in ['HEAD', 'GET', 'DELETE', 'OPTIONS']:
+            response = self.fetch('/', method=method)
+            self.assertEqual(response.code, 405)
+        for method in ['POST', 'PUT']:
+            response = self.fetch('/', method=method, body=b'')
+            self.assertEqual(response.code, 405)
+
+
+class UnimplementedNonStandardMethodsTest(SimpleHandlerTestCase):
+    # wsgiref.validate complains about unknown methods in a way that makes
+    # this test not wsgi_safe.
+    class Handler(RequestHandler):
+        def other(self):
+            # Even though this method exists, it won't get called automatically
+            # because it is not in SUPPORTED_METHODS.
+            self.write('other')
+
+    def test_unimplemented_patch(self):
+        # PATCH is recently standardized; Tornado supports it by default
+        # but wsgiref.validate doesn't like it.
+        response = self.fetch('/', method='PATCH', body=b'')
+        self.assertEqual(response.code, 405)
+
+    def test_unimplemented_other(self):
+        response = self.fetch('/', method='OTHER',
+                              allow_nonstandard_methods=True)
+        self.assertEqual(response.code, 405)
+
+
+@wsgi_safe
+class AllHTTPMethodsTest(SimpleHandlerTestCase):
+    class Handler(RequestHandler):
+        def method(self):
+            self.write(self.request.method)
+
+        get = delete = options = post = put = method
+
+    def test_standard_methods(self):
+        response = self.fetch('/', method='HEAD')
+        self.assertEqual(response.body, b'')
+        for method in ['GET', 'DELETE', 'OPTIONS']:
+            response = self.fetch('/', method=method)
+            self.assertEqual(response.body, utf8(method))
+        for method in ['POST', 'PUT']:
+            response = self.fetch('/', method=method, body=b'')
+            self.assertEqual(response.body, utf8(method))
+
+
+class PatchMethodTest(SimpleHandlerTestCase):
+    class Handler(RequestHandler):
+        SUPPORTED_METHODS = RequestHandler.SUPPORTED_METHODS + ('OTHER',)
+
+        def patch(self):
+            self.write('patch')
+
+        def other(self):
+            self.write('other')
+
+    def test_patch(self):
+        response = self.fetch('/', method='PATCH', body=b'')
+        self.assertEqual(response.body, b'patch')
+
+    def test_other(self):
+        response = self.fetch('/', method='OTHER',
+                              allow_nonstandard_methods=True)
+        self.assertEqual(response.body, b'other')
+
+
+@wsgi_safe
+class FinishInPrepareTest(SimpleHandlerTestCase):
+    class Handler(RequestHandler):
+        def prepare(self):
+            self.finish('done')
+
+        def get(self):
+            # It's difficult to assert for certain that a method did not
+            # or will not be called in an asynchronous context, but this
+            # will be logged noisily if it is reached.
+            raise Exception('should not reach this method')
+
+    def test_finish_in_prepare(self):
+        response = self.fetch('/')
+        self.assertEqual(response.body, b'done')
