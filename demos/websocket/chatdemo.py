@@ -39,11 +39,10 @@ class Application(tornado.web.Application):
             (r"/chatsocket", ChatSocketHandler),
         ]
         settings = dict(
-            cookie_secret="43oETzKXQAGaYdkL5gEmGeJJFuYh7EQnp2XdTP1o/Vo=",
+            cookie_secret="__TODO:_GENERATE_YOUR_OWN_RANDOM_VALUE_HERE__",
             template_path=os.path.join(os.path.dirname(__file__), "templates"),
             static_path=os.path.join(os.path.dirname(__file__), "static"),
             xsrf_cookies=True,
-            autoescape=None,
         )
         tornado.web.Application.__init__(self, handlers, **settings)
 
@@ -89,7 +88,8 @@ class ChatSocketHandler(tornado.websocket.WebSocketHandler):
             "id": str(uuid.uuid4()),
             "body": parsed["body"],
             }
-        chat["html"] = self.render_string("message.html", message=chat)
+        chat["html"] = tornado.escape.to_basestring(
+            self.render_string("message.html", message=chat))
 
         ChatSocketHandler.update_cache(chat)
         ChatSocketHandler.send_updates(chat)
