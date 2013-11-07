@@ -508,7 +508,7 @@ class WebSocketProtocol13(WebSocketProtocol):
         try:
             self._handle_websocket_headers()
             self._accept_connection()
-        except ValueError, StreamClosedError:
+        except (ValueError, StreamClosedError):
             gen_log.debug("Malformed WebSocket request received", exc_info=True)
             self._abort()
             return
