@@ -40,11 +40,24 @@ class ReturnValueIgnoredError(Exception):
     pass
 
 
-class _DummyFuture(object):
+class Future(object):
+    """Placeholder for an asynchronous result.
+
+    Similar to `concurrent.futures.Future`, but not thread-safe (and
+    therefore faster for use with single-threaded event loops.
+
+    In addition to ``exception`` and ``set_exception``, methods ``exc_info``
+    and ``set_exc_info`` are supported to capture tracebacks in Python 2.
+    The traceback is automatically available in Python 3, but in the
+    Python 2 futures backport this information is discarded.
+    This functionality was previously available in a separate class
+    ``TracebackFuture``, which is now a deprecated alias for this class.
+    """
     def __init__(self):
         self._done = False
         self._result = None
         self._exception = None
+        self._exc_info = None
         self._callbacks = []
 
     def cancel(self):
@@ -60,16 +73,20 @@ class _DummyFuture(object):
         return self._done
 
     def result(self, timeout=None):
-        self._check_done()
-        if self._exception:
+        if self._result is not None:
+            return self._result
+        if self._exc_info is not None:
+            raise_exc_info(self._exc_info)
+        elif self._exception is not None:
             raise self._exception
+        self._check_done()
         return self._result
 
     def exception(self, timeout=None):
-        self._check_done()
-        if self._exception:
+        if self._exception is not None:
             return self._exception
         else:
+            self._check_done()
             return None
 
     def add_done_callback(self, fn):
@@ -86,6 +103,16 @@ class _DummyFuture(object):
         self._exception = exception
         self._set_done()
 
+    def exc_info(self):
+        return self._exc_info
+
+    def set_exc_info(self, exc_info):
+        """Traceback-aware replacement for
+        `~concurrent.futures.Future.set_exception`.
+        """
+        self._exc_info = exc_info
+        self.set_exception(exc_info[1])
+
     def _check_done(self):
         if not self._done:
             raise Exception("DummyFuture does not support blocking for results")
@@ -97,38 +124,15 @@ class _DummyFuture(object):
             cb(self)
         self._callbacks = None
 
+TracebackFuture = Future
+
 if futures is None:
-    Future = _DummyFuture
+    FUTURES = Future
 else:
-    Future = futures.Future
+    FUTURES = (futures.Future, Future)
 
-
-class TracebackFuture(Future):
-    """Subclass of `Future` which can store a traceback with
-    exceptions.
-
-    The traceback is automatically available in Python 3, but in the
-    Python 2 futures backport this information is discarded.
-    """
-    def __init__(self):
-        super(TracebackFuture, self).__init__()
-        self.__exc_info = None
-
-    def exc_info(self):
-        return self.__exc_info
-
-    def set_exc_info(self, exc_info):
-        """Traceback-aware replacement for
-        `~concurrent.futures.Future.set_exception`.
-        """
-        self.__exc_info = exc_info
-        self.set_exception(exc_info[1])
-
-    def result(self):
-        if self.__exc_info is not None:
-            raise_exc_info(self.__exc_info)
-        else:
-            return super(TracebackFuture, self).result()
+def is_future(x):
+    return isinstance(x, FUTURES)
 
 
 class DummyExecutor(object):
@@ -151,6 +155,9 @@ def run_on_executor(fn):
 
     The decorated method may be called with a ``callback`` keyword
     argument and returns a future.
+
+    This decorator should be used only on methods of objects with attributes
+    ``executor`` and ``io_loop``.
     """
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):

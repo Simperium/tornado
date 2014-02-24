@@ -171,6 +171,85 @@ class TestIOLoop(AsyncTestCase):
         self.io_loop.add_callback(lambda: self.io_loop.add_callback(self.stop))
         self.wait()
 
+    def test_close_file_object(self):
+        """When a file object is used instead of a numeric file descriptor,
+        the object should be closed (by IOLoop.close(all_fds=True),
+        not just the fd.
+        """
+        # Use a socket since they are supported by IOLoop on all platforms.
+        # Unfortunately, sockets don't support the .closed attribute for
+        # inspecting their close status, so we must use a wrapper.
+        class SocketWrapper(object):
+            def __init__(self, sockobj):
+                self.sockobj = sockobj
+                self.closed = False
+
+            def fileno(self):
+                return self.sockobj.fileno()
+
+            def close(self):
+                self.closed = True
+                self.sockobj.close()
+        sockobj, port = bind_unused_port()
+        socket_wrapper = SocketWrapper(sockobj)
+        io_loop = IOLoop()
+        io_loop.add_handler(socket_wrapper, lambda fd, events: None,
+                            IOLoop.READ)
+        io_loop.close(all_fds=True)
+        self.assertTrue(socket_wrapper.closed)
+
+    def test_handler_callback_file_object(self):
+        """The handler callback receives the same fd object it passed in."""
+        server_sock, port = bind_unused_port()
+        fds = []
+        def handle_connection(fd, events):
+            fds.append(fd)
+            conn, addr = server_sock.accept()
+            conn.close()
+            self.stop()
+        self.io_loop.add_handler(server_sock, handle_connection, IOLoop.READ)
+        with contextlib.closing(socket.socket()) as client_sock:
+            client_sock.connect(('127.0.0.1', port))
+            self.wait()
+        self.io_loop.remove_handler(server_sock)
+        self.io_loop.add_handler(server_sock.fileno(), handle_connection,
+                                 IOLoop.READ)
+        with contextlib.closing(socket.socket()) as client_sock:
+            client_sock.connect(('127.0.0.1', port))
+            self.wait()
+        self.assertIs(fds[0], server_sock)
+        self.assertIs(fds[1], server_sock.fileno())
+        self.io_loop.remove_handler(server_sock.fileno())
+        server_sock.close()
+
+    def test_mixed_fd_fileobj(self):
+        server_sock, port = bind_unused_port()
+        def f(fd, events):
+            pass
+        self.io_loop.add_handler(server_sock, f, IOLoop.READ)
+        with self.assertRaises(Exception):
+            # The exact error is unspecified - some implementations use
+            # IOError, others use ValueError.
+            self.io_loop.add_handler(server_sock.fileno(), f, IOLoop.READ)
+        self.io_loop.remove_handler(server_sock.fileno())
+        server_sock.close()
+
+    def test_reentrant(self):
+        """Calling start() twice should raise an error, not deadlock."""
+        returned_from_start = [False]
+        got_exception = [False]
+        def callback():
+            try:
+                self.io_loop.start()
+                returned_from_start[0] = True
+            except Exception:
+                got_exception[0] = True
+            self.stop()
+        self.io_loop.add_callback(callback)
+        self.wait()
+        self.assertTrue(got_exception[0])
+        self.assertFalse(returned_from_start[0])
+
 
 # Deliberately not a subclass of AsyncTestCase so the IOLoop isn't
 # automatically set as current.
@@ -328,6 +407,7 @@ class TestIOLoopRunSync(unittest.TestCase):
         def f():
             yield gen.Task(self.io_loop.add_timeout, self.io_loop.time() + 1)
         self.assertRaises(TimeoutError, self.io_loop.run_sync, f, timeout=0.01)
+
 
 if __name__ == "__main__":
     unittest.main()

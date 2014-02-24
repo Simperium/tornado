@@ -20,6 +20,11 @@ import re
 import socket
 import sys
 
+try:
+    import urllib.parse as urllib_parse  # py3
+except ImportError:
+    import urllib as urllib_parse  # py2
+
 wsgi_safe_tests = []
 
 relpath = lambda *a: os.path.join(os.path.dirname(__file__), *a)
@@ -54,6 +59,11 @@ class SimpleHandlerTestCase(WebTestCase):
     """
     def get_handlers(self):
         return [('/', self.Handler)]
+
+
+class HelloHandler(RequestHandler):
+    def get(self):
+        self.write('hello')
 
 
 class CookieTestRequestHandler(RequestHandler):
@@ -479,8 +489,21 @@ class HeaderInjectionHandler(RequestHandler):
 
 
 class GetArgumentHandler(RequestHandler):
-    def get(self):
-        self.write(self.get_argument("foo", "default"))
+    def prepare(self):
+        if self.get_argument('source', None) == 'query':
+            method = self.get_query_argument
+        elif self.get_argument('source', None) == 'body':
+            method = self.get_body_argument
+        else:
+            method = self.get_argument
+        self.finish(method("foo", "default"))
+
+
+class GetArgumentsHandler(RequestHandler):
+    def prepare(self):
+        self.finish(dict(default=self.get_arguments("foo"),
+                         query=self.get_query_arguments("foo"),
+                         body=self.get_body_arguments("foo")))
 
 
 # This test is shared with wsgi_test.py
@@ -521,6 +544,7 @@ class WSGISafeWebTest(WebTestCase):
             url("/redirect", RedirectHandler),
             url("/header_injection", HeaderInjectionHandler),
             url("/get_argument", GetArgumentHandler),
+            url("/get_arguments", GetArgumentsHandler),
         ]
         return urls
 
@@ -561,6 +585,14 @@ class WSGISafeWebTest(WebTestCase):
         self.assertEqual(data, {u('path'): [u('bytes'), u('c3a9')],
                                 u('query'): [u('bytes'), u('c3a9')],
                                 })
+
+    def test_decode_argument_invalid_unicode(self):
+        # test that invalid unicode in URLs causes 400, not 500
+        with ExpectLog(gen_log, ".*Invalid unicode.*"):
+            response = self.fetch("/typecheck/invalid%FF")
+            self.assertEqual(response.code, 400)
+            response = self.fetch("/typecheck/invalid?foo=%FF")
+            self.assertEqual(response.code, 400)
 
     def test_decode_argument_plus(self):
         # These urls are all equivalent.
@@ -645,6 +677,49 @@ js_embed()
         response = self.fetch("/get_argument?foo=")
         self.assertEqual(response.body, b"")
         response = self.fetch("/get_argument")
+        self.assertEqual(response.body, b"default")
+
+        # Test merging of query and body arguments.
+        # In singular form, body arguments take precedence over query arguments.
+        body = urllib_parse.urlencode(dict(foo="hello"))
+        response = self.fetch("/get_argument?foo=bar", method="POST", body=body)
+        self.assertEqual(response.body, b"hello")
+        # In plural methods they are merged.
+        response = self.fetch("/get_arguments?foo=bar",
+                              method="POST", body=body)
+        self.assertEqual(json_decode(response.body),
+                         dict(default=['bar', 'hello'],
+                              query=['bar'],
+                              body=['hello']))
+
+    def test_get_query_arguments(self):
+        # send as a post so we can ensure the separation between query
+        # string and body arguments.
+        body = urllib_parse.urlencode(dict(foo="hello"))
+        response = self.fetch("/get_argument?source=query&foo=bar",
+                              method="POST", body=body)
+        self.assertEqual(response.body, b"bar")
+        response = self.fetch("/get_argument?source=query&foo=",
+                              method="POST", body=body)
+        self.assertEqual(response.body, b"")
+        response = self.fetch("/get_argument?source=query",
+                              method="POST", body=body)
+        self.assertEqual(response.body, b"default")
+
+    def test_get_body_arguments(self):
+        body = urllib_parse.urlencode(dict(foo="bar"))
+        response = self.fetch("/get_argument?source=body&foo=hello",
+                              method="POST", body=body)
+        self.assertEqual(response.body, b"bar")
+
+        body = urllib_parse.urlencode(dict(foo=""))
+        response = self.fetch("/get_argument?source=body&foo=hello",
+                              method="POST", body=body)
+        self.assertEqual(response.body, b"")
+
+        body = urllib_parse.urlencode(dict())
+        response = self.fetch("/get_argument?source=body&foo=hello",
+                              method="POST", body=body)
         self.assertEqual(response.body, b"default")
 
     def test_no_gzip(self):
@@ -899,6 +974,26 @@ class StaticFileTest(WebTestCase):
             self.assertEqual(response.body, utf8(f.read()))
         self.assertEqual(response.headers.get("Content-Length"), "26")
         self.assertEqual(response.headers.get("Content-Range"), None)
+
+    def test_static_with_range_full_past_end(self):
+        response = self.fetch('/static/robots.txt', headers={
+            'Range': 'bytes=0-10000000'})
+        self.assertEqual(response.code, 200)
+        robots_file_path = os.path.join(self.static_dir, "robots.txt")
+        with open(robots_file_path) as f:
+            self.assertEqual(response.body, utf8(f.read()))
+        self.assertEqual(response.headers.get("Content-Length"), "26")
+        self.assertEqual(response.headers.get("Content-Range"), None)
+
+    def test_static_with_range_partial_past_end(self):
+        response = self.fetch('/static/robots.txt', headers={
+            'Range': 'bytes=1-10000000'})
+        self.assertEqual(response.code, 206)
+        robots_file_path = os.path.join(self.static_dir, "robots.txt")
+        with open(robots_file_path) as f:
+            self.assertEqual(response.body, utf8(f.read()[1:]))
+        self.assertEqual(response.headers.get("Content-Length"), "25")
+        self.assertEqual(response.headers.get("Content-Range"), "bytes 1-25/26")
 
     def test_static_with_range_end_edge(self):
         response = self.fetch('/static/robots.txt', headers={
@@ -1460,6 +1555,91 @@ class SetCurrentUserTest(SimpleHandlerTestCase):
 
 
 @wsgi_safe
+class GetCurrentUserTest(WebTestCase):
+    def get_app_kwargs(self):
+        class WithoutUserModule(UIModule):
+            def render(self):
+                return ''
+
+        class WithUserModule(UIModule):
+            def render(self):
+                return str(self.current_user)
+
+        loader = DictLoader({
+            'without_user.html': '',
+            'with_user.html': '{{ current_user }}',
+            'without_user_module.html': '{% module WithoutUserModule() %}',
+            'with_user_module.html': '{% module WithUserModule() %}',
+        })
+        return dict(template_loader=loader,
+                    ui_modules={'WithUserModule': WithUserModule,
+                                'WithoutUserModule': WithoutUserModule})
+
+    def tearDown(self):
+        super(GetCurrentUserTest, self).tearDown()
+        RequestHandler._template_loaders.clear()
+
+    def get_handlers(self):
+        class CurrentUserHandler(RequestHandler):
+            def prepare(self):
+                self.has_loaded_current_user = False
+
+            def get_current_user(self):
+                self.has_loaded_current_user = True
+                return ''
+
+        class WithoutUserHandler(CurrentUserHandler):
+            def get(self):
+                self.render_string('without_user.html')
+                self.finish(str(self.has_loaded_current_user))
+
+        class WithUserHandler(CurrentUserHandler):
+            def get(self):
+                self.render_string('with_user.html')
+                self.finish(str(self.has_loaded_current_user))
+
+        class CurrentUserModuleHandler(CurrentUserHandler):
+            def get_template_namespace(self):
+                # If RequestHandler.get_template_namespace is called, then
+                # get_current_user is evaluated. Until #820 is fixed, this
+                # is a small hack to circumvent the issue.
+                return self.ui
+
+        class WithoutUserModuleHandler(CurrentUserModuleHandler):
+            def get(self):
+                self.render_string('without_user_module.html')
+                self.finish(str(self.has_loaded_current_user))
+
+        class WithUserModuleHandler(CurrentUserModuleHandler):
+            def get(self):
+                self.render_string('with_user_module.html')
+                self.finish(str(self.has_loaded_current_user))
+
+        return [('/without_user', WithoutUserHandler),
+                ('/with_user', WithUserHandler),
+                ('/without_user_module', WithoutUserModuleHandler),
+                ('/with_user_module', WithUserModuleHandler)]
+
+    @unittest.skip('needs fix')
+    def test_get_current_user_is_lazy(self):
+        # TODO: Make this test pass. See #820.
+        response = self.fetch('/without_user')
+        self.assertEqual(response.body, b'False')
+
+    def test_get_current_user_works(self):
+        response = self.fetch('/with_user')
+        self.assertEqual(response.body, b'True')
+
+    def test_get_current_user_from_ui_module_is_lazy(self):
+        response = self.fetch('/without_user_module')
+        self.assertEqual(response.body, b'False')
+
+    def test_get_current_user_from_ui_module_works(self):
+        response = self.fetch('/with_user_module')
+        self.assertEqual(response.body, b'True')
+
+
+@wsgi_safe
 class UnimplementedHTTPMethodsTest(SimpleHandlerTestCase):
     class Handler(RequestHandler):
         pass
@@ -1548,3 +1728,68 @@ class FinishInPrepareTest(SimpleHandlerTestCase):
     def test_finish_in_prepare(self):
         response = self.fetch('/')
         self.assertEqual(response.body, b'done')
+
+
+@wsgi_safe
+class Default404Test(WebTestCase):
+    def get_handlers(self):
+        # If there are no handlers at all a default redirect handler gets added.
+        return [('/foo', RequestHandler)]
+
+    def test_404(self):
+        response = self.fetch('/')
+        self.assertEqual(response.code, 404)
+        self.assertEqual(response.body,
+                         b'<html><title>404: Not Found</title>'
+                         b'<body>404: Not Found</body></html>')
+
+
+@wsgi_safe
+class Custom404Test(WebTestCase):
+    def get_handlers(self):
+        return [('/foo', RequestHandler)]
+
+    def get_app_kwargs(self):
+        class Custom404Handler(RequestHandler):
+            def get(self):
+                self.set_status(404)
+                self.write('custom 404 response')
+
+        return dict(default_handler_class=Custom404Handler)
+
+    def test_404(self):
+        response = self.fetch('/')
+        self.assertEqual(response.code, 404)
+        self.assertEqual(response.body, b'custom 404 response')
+
+
+@wsgi_safe
+class DefaultHandlerArgumentsTest(WebTestCase):
+    def get_handlers(self):
+        return [('/foo', RequestHandler)]
+
+    def get_app_kwargs(self):
+        return dict(default_handler_class=ErrorHandler,
+                    default_handler_args=dict(status_code=403))
+
+    def test_403(self):
+        response = self.fetch('/')
+        self.assertEqual(response.code, 403)
+
+
+@wsgi_safe
+class HandlerByNameTest(WebTestCase):
+    def get_handlers(self):
+        # All three are equivalent.
+        return [('/hello1', HelloHandler),
+                ('/hello2', 'tornado.test.web_test.HelloHandler'),
+                url('/hello3', 'tornado.test.web_test.HelloHandler'),
+                ]
+
+    def test_handler_by_name(self):
+        resp = self.fetch('/hello1')
+        self.assertEqual(resp.body, b'hello')
+        resp = self.fetch('/hello2')
+        self.assertEqual(resp.body, b'hello')
+        resp = self.fetch('/hello3')
+        self.assertEqual(resp.body, b'hello')

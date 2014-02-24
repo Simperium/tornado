@@ -33,6 +33,7 @@ from __future__ import absolute_import, division, print_function, with_statement
 
 import sys
 import time
+import copy
 import tornado
 
 from tornado import escape
@@ -142,11 +143,14 @@ class HTTPRequest(object):
         self.path += urllib_parse.quote(from_wsgi_str(environ.get("PATH_INFO", "")))
         self.uri = self.path
         self.arguments = {}
+        self.query_arguments = {}
+        self.body_arguments = {}
         self.query = environ.get("QUERY_STRING", "")
         if self.query:
             self.uri += "?" + self.query
             self.arguments = parse_qs_bytes(native_str(self.query),
                                             keep_blank_values=True)
+            self.query_arguments = copy.deepcopy(self.arguments)
         self.version = "HTTP/1.1"
         self.headers = httputil.HTTPHeaders()
         if environ.get("CONTENT_TYPE"):
@@ -171,7 +175,10 @@ class HTTPRequest(object):
         # Parse request body
         self.files = {}
         httputil.parse_body_arguments(self.headers.get("Content-Type", ""),
-                                      self.body, self.arguments, self.files)
+                                      self.body, self.body_arguments, self.files)
+
+        for k, v in self.body_arguments.items():
+            self.arguments.setdefault(k, []).extend(v)
 
         self._start_time = time.time()
         self._finish_time = None
@@ -207,6 +214,16 @@ class HTTPRequest(object):
 
 class WSGIContainer(object):
     r"""Makes a WSGI-compatible function runnable on Tornado's HTTP server.
+
+    .. warning::
+
+       WSGI is a *synchronous* interface, while Tornado's concurrency model
+       is based on single-threaded asynchronous execution.  This means that
+       running a WSGI app with Tornado's `WSGIContainer` is *less scalable*
+       than running the same app in a multi-threaded WSGI server like
+       ``gunicorn`` or ``uwsgi``.  Use `WSGIContainer` only when there are
+       benefits to combining Tornado and WSGI in the same process that
+       outweigh the reduced scalability.
 
     Wrap a WSGI function in a `WSGIContainer` and pass it to `.HTTPServer` to
     run it. For example::
@@ -287,7 +304,7 @@ class WSGIContainer(object):
             "REQUEST_METHOD": request.method,
             "SCRIPT_NAME": "",
             "PATH_INFO": to_wsgi_str(escape.url_unescape(
-            request.path, encoding=None, plus=False)),
+                request.path, encoding=None, plus=False)),
             "QUERY_STRING": request.query,
             "REMOTE_ADDR": request.remote_ip,
             "SERVER_NAME": host,
