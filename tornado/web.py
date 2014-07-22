@@ -72,7 +72,6 @@ import time
 import tornado
 import traceback
 import types
-import uuid
 
 from tornado.concurrent import Future
 from tornado import escape
@@ -82,7 +81,7 @@ from tornado.log import access_log, app_log, gen_log
 from tornado import stack_context
 from tornado import template
 from tornado.escape import utf8, _unicode
-from tornado.util import bytes_type, import_object, ObjectDict, raise_exc_info, unicode_type
+from tornado.util import bytes_type, import_object, ObjectDict, raise_exc_info, unicode_type, _websocket_mask
 
 try:
     from io import BytesIO  # python 3
@@ -103,6 +102,39 @@ try:
     from urllib import urlencode  # py2
 except ImportError:
     from urllib.parse import urlencode  # py3
+
+
+MIN_SUPPORTED_SIGNED_VALUE_VERSION = 1
+"""The oldest signed value version supported by this version of Tornado.
+
+Signed values older than this version cannot be decoded.
+
+.. versionadded:: 3.2.1
+"""
+
+MAX_SUPPORTED_SIGNED_VALUE_VERSION = 2
+"""The newest signed value version supported by this version of Tornado.
+
+Signed values newer than this version cannot be decoded.
+
+.. versionadded:: 3.2.1
+"""
+
+DEFAULT_SIGNED_VALUE_VERSION = 2
+"""The signed value version produced by `.RequestHandler.create_signed_value`.
+
+May be overridden by passing a ``version`` keyword argument.
+
+.. versionadded:: 3.2.1
+"""
+
+DEFAULT_SIGNED_VALUE_MIN_VERSION = 1
+"""The oldest signed value accepted by `.RequestHandler.get_secure_cookie`.
+
+May be overrided by passing a ``min_version`` keyword argument.
+
+.. versionadded:: 3.2.1
+"""
 
 
 class RequestHandler(object):
@@ -524,7 +556,8 @@ class RequestHandler(object):
         for name in self.request.cookies:
             self.clear_cookie(name, path=path, domain=domain)
 
-    def set_secure_cookie(self, name, value, expires_days=30, **kwargs):
+    def set_secure_cookie(self, name, value, expires_days=30, version=None,
+                          **kwargs):
         """Signs and timestamps a cookie so it cannot be forged.
 
         You must specify the ``cookie_secret`` setting in your Application
@@ -539,32 +572,50 @@ class RequestHandler(object):
 
         Secure cookies may contain arbitrary byte values, not just unicode
         strings (unlike regular cookies)
+
+        .. versionchanged:: 3.2.1
+
+           Added the ``version`` argument.  Introduced cookie version 2
+           and made it the default.
         """
-        self.set_cookie(name, self.create_signed_value(name, value),
+        self.set_cookie(name, self.create_signed_value(name, value,
+                                                       version=version),
                         expires_days=expires_days, **kwargs)
 
-    def create_signed_value(self, name, value):
+    def create_signed_value(self, name, value, version=None):
         """Signs and timestamps a string so it cannot be forged.
 
         Normally used via set_secure_cookie, but provided as a separate
         method for non-cookie uses.  To decode a value not stored
         as a cookie use the optional value argument to get_secure_cookie.
+
+        .. versionchanged:: 3.2.1
+
+           Added the ``version`` argument.  Introduced cookie version 2
+           and made it the default.
         """
         self.require_setting("cookie_secret", "secure cookies")
         return create_signed_value(self.application.settings["cookie_secret"],
-                                   name, value)
+                                   name, value, version=version)
 
-    def get_secure_cookie(self, name, value=None, max_age_days=31):
+    def get_secure_cookie(self, name, value=None, max_age_days=31,
+                          min_version=None):
         """Returns the given signed cookie if it validates, or None.
 
         The decoded cookie value is returned as a byte string (unlike
         `get_cookie`).
+
+        .. versionchanged:: 3.2.1
+
+           Added the ``min_version`` argument.  Introduced cookie version 2;
+           both versions 1 and 2 are accepted by default.
         """
         self.require_setting("cookie_secret", "secure cookies")
         if value is None:
             value = self.get_cookie(name)
         return decode_signed_value(self.application.settings["cookie_secret"],
-                                   name, value, max_age_days=max_age_days)
+                                   name, value, max_age_days=max_age_days,
+                                   min_version=min_version)
 
     def redirect(self, url, permanent=False, status=None):
         """Sends a redirect to the given (optionally relative) URL.
@@ -1017,15 +1068,86 @@ class RequestHandler(object):
         as a potential forgery.
 
         See http://en.wikipedia.org/wiki/Cross-site_request_forgery
+
+        .. versionchanged:: 3.2.2
+           The xsrf token will now be have a random mask applied in every
+           request, which makes it safe to include the token in pages
+           that are compressed.  See http://breachattack.com for more
+           information on the issue fixed by this change.  Old (version 1)
+           cookies will be converted to version 2 when this method is called
+           unless the ``xsrf_cookie_version`` `Application` setting is
+           set to 1.
         """
         if not hasattr(self, "_xsrf_token"):
-            token = self.get_cookie("_xsrf")
-            if not token:
-                token = binascii.b2a_hex(uuid.uuid4().bytes)
+            version, token, timestamp = self._get_raw_xsrf_token()
+            output_version = self.settings.get("xsrf_cookie_version", 2)
+            if output_version == 1:
+                self._xsrf_token = binascii.b2a_hex(token)
+            elif output_version == 2:
+                mask = os.urandom(4)
+                self._xsrf_token = b"|".join([
+                    b"2",
+                    binascii.b2a_hex(mask),
+                    binascii.b2a_hex(_websocket_mask(mask, token)),
+                    utf8(str(int(timestamp)))])
+            else:
+                raise ValueError("unknown xsrf cookie version %d",
+                                 output_version)
+            if version is None:
                 expires_days = 30 if self.current_user else None
-                self.set_cookie("_xsrf", token, expires_days=expires_days)
-            self._xsrf_token = token
+                self.set_cookie("_xsrf", self._xsrf_token,
+                                expires_days=expires_days)
         return self._xsrf_token
+
+    def _get_raw_xsrf_token(self):
+        """Read or generate the xsrf token in its raw form.
+
+        The raw_xsrf_token is a tuple containing:
+
+        * version: the version of the cookie from which this token was read,
+          or None if we generated a new token in this request.
+        * token: the raw token data; random (non-ascii) bytes.
+        * timestamp: the time this token was generated (will not be accurate
+          for version 1 cookies)
+        """
+        if not hasattr(self, '_raw_xsrf_token'):
+            cookie = self.get_cookie("_xsrf")
+            if cookie:
+                version, token, timestamp = self._decode_xsrf_token(cookie)
+            else:
+                version, token, timestamp = None, None, None
+            if token is None:
+                version = None
+                token = os.urandom(16)
+                timestamp = time.time()
+            self._raw_xsrf_token = (version, token, timestamp)
+        return self._raw_xsrf_token
+
+    def _decode_xsrf_token(self, cookie):
+        """Convert a cookie string into a the tuple form returned by
+        _get_raw_xsrf_token.
+        """
+        m = _signed_value_version_re.match(utf8(cookie))
+        if m:
+            version = int(m.group(1))
+            if version == 2:
+                _, mask, masked_token, timestamp = cookie.split("|")
+                mask = binascii.a2b_hex(utf8(mask))
+                token = _websocket_mask(
+                    mask, binascii.a2b_hex(utf8(masked_token)))
+                timestamp = int(timestamp)
+                return version, token, timestamp
+            else:
+                # Treat unknown versions as not present instead of failing.
+                return None, None, None
+        elif len(cookie) == 32:
+            version = 1
+            token = binascii.a2b_hex(utf8(cookie))
+            # We don't have a usable timestamp in older versions.
+            timestamp = int(time.time())
+            return (version, token, timestamp)
+        else:
+            return None, None, None
 
     def check_xsrf_cookie(self):
         """Verifies that the ``_xsrf`` cookie matches the ``_xsrf`` argument.
@@ -1047,13 +1169,19 @@ class RequestHandler(object):
         information please see
         http://www.djangoproject.com/weblog/2011/feb/08/security/
         http://weblog.rubyonrails.org/2011/2/8/csrf-protection-bypass-in-ruby-on-rails
+
+        .. versionchanged:: 3.2.2
+           Added support for cookie version 2.  Both versions 1 and 2 are
+           supported.
         """
         token = (self.get_argument("_xsrf", None) or
                  self.request.headers.get("X-Xsrftoken") or
                  self.request.headers.get("X-Csrftoken"))
         if not token:
             raise HTTPError(403, "'_xsrf' argument missing from POST")
-        if self.xsrf_token != token:
+        _, token, _ = self._decode_xsrf_token(token)
+        _, expected_token, _ = self._get_raw_xsrf_token()
+        if not _time_independent_equals(utf8(token), utf8(expected_token)):
             raise HTTPError(403, "XSRF cookie does not match POST argument")
 
     def xsrf_form_html(self):
@@ -2642,29 +2770,101 @@ else:
         return result == 0
 
 
-def create_signed_value(secret, name, value):
-    timestamp = utf8(str(int(time.time())))
+def create_signed_value(secret, name, value, version=None, clock=None):
+    if version is None:
+        version = DEFAULT_SIGNED_VALUE_VERSION
+    if clock is None:
+        clock = time.time
+    timestamp = utf8(str(int(clock())))
     value = base64.b64encode(utf8(value))
-    signature = _create_signature(secret, name, value, timestamp)
-    value = b"|".join([value, timestamp, signature])
-    return value
+    if version == 1:
+        signature = _create_signature_v1(secret, name, value, timestamp)
+        value = b"|".join([value, timestamp, signature])
+        return value
+    elif version == 2:
+        # The v2 format consists of a version number and a series of
+        # length-prefixed fields "%d:%s", the last of which is a
+        # signature, all separated by pipes.  All numbers are in
+        # decimal format with no leading zeros.  The signature is an
+        # HMAC-SHA256 of the whole string up to that point, including
+        # the final pipe.
+        #
+        # The fields are:
+        # - format version (i.e. 2; no length prefix)
+        # - key version (currently 0; reserved for future key rotation features)
+        # - timestamp (integer seconds since epoch)
+        # - name (not encoded; assumed to be ~alphanumeric)
+        # - value (base64-encoded)
+        # - signature (hex-encoded; no length prefix)
+        def format_field(s):
+            return utf8("%d:" % len(s)) + utf8(s)
+        to_sign = b"|".join([
+            b"2|1:0",
+            format_field(timestamp),
+            format_field(name),
+            format_field(value),
+            b''])
+        signature = _create_signature_v2(secret, to_sign)
+        return to_sign + signature
+    else:
+        raise ValueError("Unsupported version %d" % version)
 
+# A leading version number in decimal with no leading zeros, followed by a pipe.
+_signed_value_version_re = re.compile(br"^([1-9][0-9]*)\|(.*)$")
 
-def decode_signed_value(secret, name, value, max_age_days=31):
+def decode_signed_value(secret, name, value, max_age_days=31, clock=None,min_version=None):
+    if clock is None:
+        clock = time.time
+    if min_version is None:
+        min_version = DEFAULT_SIGNED_VALUE_MIN_VERSION
+    if min_version > 2:
+        raise ValueError("Unsupported min_version %d" % min_version)
     if not value:
         return None
+
+    # Figure out what version this is.  Version 1 did not include an
+    # explicit version field and started with arbitrary base64 data,
+    # which makes this tricky.
+    value = utf8(value)
+    m = _signed_value_version_re.match(value)
+    if m is None:
+        version = 1
+    else:
+        try:
+            version = int(m.group(1))
+            if version > 999:
+                # Certain payloads from the version-less v1 format may
+                # be parsed as valid integers.  Due to base64 padding
+                # restrictions, this can only happen for numbers whose
+                # length is a multiple of 4, so we can treat all
+                # numbers up to 999 as versions, and for the rest we
+                # fall back to v1 format.
+                version = 1
+        except ValueError:
+            version = 1
+
+    if version < min_version:
+        return None
+    if version == 1:
+        return _decode_signed_value_v1(secret, name, value, max_age_days, clock)
+    elif version == 2:
+        return _decode_signed_value_v2(secret, name, value, max_age_days, clock)
+    else:
+        return None
+
+def _decode_signed_value_v1(secret, name, value, max_age_days, clock):
     parts = utf8(value).split(b"|")
     if len(parts) != 3:
         return None
-    signature = _create_signature(secret, name, parts[0], parts[1])
+    signature = _create_signature_v1(secret, name, parts[0], parts[1])
     if not _time_independent_equals(parts[2], signature):
         gen_log.warning("Invalid cookie signature %r", value)
         return None
     timestamp = int(parts[1])
-    if timestamp < time.time() - max_age_days * 86400:
+    if timestamp < clock() - max_age_days * 86400:
         gen_log.warning("Expired cookie %r", value)
         return None
-    if timestamp > time.time() + 31 * 86400:
+    if timestamp > clock() + 31 * 86400:
         # _cookie_signature does not hash a delimiter between the
         # parts of the cookie, so an attacker could transfer trailing
         # digits from the payload to the timestamp without altering the
@@ -2681,8 +2881,49 @@ def decode_signed_value(secret, name, value, max_age_days=31):
         return None
 
 
-def _create_signature(secret, *parts):
+def _decode_signed_value_v2(secret, name, value, max_age_days, clock):
+    def _consume_field(s):
+        length, _, rest = s.partition(b':')
+        n = int(length)
+        field_value = rest[:n]
+        # In python 3, indexing bytes returns small integers; we must
+        # use a slice to get a byte string as in python 2.
+        if rest[n:n+1] != b'|':
+            raise ValueError("malformed v2 signed value field")
+        rest = rest[n+1:]
+        return field_value, rest
+    rest = value[2:]  # remove version number
+    try:
+        key_version, rest = _consume_field(rest)
+        timestamp, rest = _consume_field(rest)
+        name_field, rest = _consume_field(rest)
+        value_field, rest = _consume_field(rest)
+    except ValueError:
+        return None
+    passed_sig = rest
+    signed_string = value[:-len(passed_sig)]
+    expected_sig = _create_signature_v2(secret, signed_string)
+    if not _time_independent_equals(passed_sig, expected_sig):
+        return None
+    if name_field != utf8(name):
+        return None
+    timestamp = int(timestamp)
+    if timestamp < clock() - max_age_days * 86400:
+        # The signature has expired.
+        return None
+    try:
+        return base64.b64decode(value_field)
+    except Exception:
+        return None
+
+
+def _create_signature_v1(secret, *parts):
     hash = hmac.new(utf8(secret), digestmod=hashlib.sha1)
     for part in parts:
         hash.update(utf8(part))
+    return utf8(hash.hexdigest())
+
+def _create_signature_v2(secret, s):
+    hash = hmac.new(utf8(secret), digestmod=hashlib.sha256)
+    hash.update(utf8(s))
     return utf8(hash.hexdigest())

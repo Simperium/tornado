@@ -42,7 +42,8 @@ if sys.platform == 'win32' and sys.version_info > (2, 6):
     build_errors = (CCompilerError, DistutilsExecError,
                     DistutilsPlatformError, IOError)
 else:
-    build_errors = (CCompilerError, DistutilsExecError, DistutilsPlatformError)
+    build_errors = (CCompilerError, DistutilsExecError, DistutilsPlatformError,
+                    SystemError)
 
 class custom_build_ext(build_ext):
     """Allow C extension building to fail.
@@ -114,7 +115,7 @@ http://api.mongodb.org/python/current/installation.html#osx
 
 kwargs = {}
 
-version = "3.2"
+version = "3.2.2"
 
 with open('README.rst') as f:
     kwargs['long_description'] = f.read()
