@@ -638,4 +638,6 @@ def _unquote_or_none(s):
     """
     if s is None:
         return s
+    if self.settings.get("no_unescape"):
+        return s
     return url_unescape(s, encoding=None, plus=False)
