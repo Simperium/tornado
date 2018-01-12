@@ -16,9 +16,19 @@
 
 """A command line parsing module that lets modules define their own options.
 
-Each module defines its own options which are added to the global
-option namespace, e.g.::
+This module is inspired by Google's `gflags
+<https://github.com/google/python-gflags>`_. The primary difference
+with libraries such as `argparse` is that a global registry is used so
+that options may be defined in any module (it also enables
+`tornado.log` by default). The rest of Tornado does not depend on this
+module, so feel free to use `argparse` or other configuration
+libraries if you prefer them.
 
+Options must be defined with `tornado.options.define` before use,
+generally at the top level of a module. The options are then
+accessible as attributes of `tornado.options.options`::
+
+    # myapp/db.py
     from tornado.options import define, options
 
     define("mysql_host", default="127.0.0.1:3306", help="Main user DB")
@@ -29,28 +39,36 @@ option namespace, e.g.::
         db = database.Connection(options.mysql_host)
         ...
 
+    # myapp/server.py
+    from tornado.options import define, options
+
+    define("port", default=8080, help="port to listen on")
+
+    def start_server():
+        app = make_app()
+        app.listen(options.port)
+
 The ``main()`` method of your application does not need to be aware of all of
 the options used throughout your program; they are all automatically loaded
 when the modules are loaded.  However, all modules that define options
 must have been imported before the command line is parsed.
 
 Your ``main()`` method can parse the command line or parse a config file with
-either::
+either `parse_command_line` or `parse_config_file`::
 
-    tornado.options.parse_command_line()
-    # or
-    tornado.options.parse_config_file("/etc/server.conf")
+    import myapp.db, myapp.server
+    import tornado.options
 
-Command line formats are what you would expect (``--myoption=myvalue``).
-Config files are just Python files. Global names become options, e.g.::
+    if __name__ == '__main__':
+        tornado.options.parse_command_line()
+        # or
+        tornado.options.parse_config_file("/etc/server.conf")
 
-    myoption = "myvalue"
-    myotheroption = "myothervalue"
+.. note::
 
-We support `datetimes <datetime.datetime>`, `timedeltas
-<datetime.timedelta>`, ints, and floats (just pass a ``type`` kwarg to
-`define`). We also accept multi-value options. See the documentation for
-`define()` below.
+   When using multiple ``parse_*`` functions, pass ``final=False`` to all
+   but the last one, or side effects may occur twice (in particular,
+   this can result in log messages being doubled).
 
 `tornado.options.options` is a singleton instance of `OptionParser`, and
 the top-level functions in this module (`define`, `parse_command_line`, etc)
@@ -68,9 +86,16 @@ instances to define isolated sets of options, such as for subcommands.
        from tornado.options import options, parse_command_line
        options.logging = None
        parse_command_line()
+
+.. versionchanged:: 4.3
+   Dashes and underscores are fully interchangeable in option names;
+   options can be defined, set, and read with any mix of the two.
+   Dashes are typical for command-line usage while config files require
+   underscores.
+
 """
 
-from __future__ import absolute_import, division, print_function, with_statement
+from __future__ import absolute_import, division, print_function
 
 import datetime
 import numbers
@@ -79,7 +104,7 @@ import sys
 import os
 import textwrap
 
-from tornado.escape import _unicode
+from tornado.escape import _unicode, native_str
 from tornado.log import define_logging_options
 from tornado import stack_context
 from tornado.util import basestring_type, exec_in
@@ -103,28 +128,40 @@ class OptionParser(object):
         self.define("help", type=bool, help="show this help information",
                     callback=self._help_callback)
 
+    def _normalize_name(self, name):
+        return name.replace('_', '-')
+
     def __getattr__(self, name):
+        name = self._normalize_name(name)
         if isinstance(self._options.get(name), _Option):
             return self._options[name].value()
         raise AttributeError("Unrecognized option %r" % name)
 
     def __setattr__(self, name, value):
+        name = self._normalize_name(name)
         if isinstance(self._options.get(name), _Option):
             return self._options[name].set(value)
         raise AttributeError("Unrecognized option %r" % name)
 
     def __iter__(self):
-        return iter(self._options)
+        return (opt.name for opt in self._options.values())
 
-    def __getitem__(self, item):
-        return self._options[item].value()
+    def __contains__(self, name):
+        name = self._normalize_name(name)
+        return name in self._options
+
+    def __getitem__(self, name):
+        return self.__getattr__(name)
+
+    def __setitem__(self, name, value):
+        return self.__setattr__(name, value)
 
     def items(self):
         """A sequence of (name, value) pairs.
 
         .. versionadded:: 3.1
         """
-        return [(name, opt.value()) for name, opt in self._options.items()]
+        return [(opt.name, opt.value()) for name, opt in self._options.items()]
 
     def groups(self):
         """The set of option-groups created by ``define``.
@@ -151,7 +188,7 @@ class OptionParser(object):
         .. versionadded:: 3.1
         """
         return dict(
-            (name, opt.value()) for name, opt in self._options.items()
+            (opt.name, opt.value()) for name, opt in self._options.items()
             if not group or group == opt.group_name)
 
     def as_dict(self):
@@ -160,19 +197,19 @@ class OptionParser(object):
         .. versionadded:: 3.1
         """
         return dict(
-            (name, opt.value()) for name, opt in self._options.items())
+            (opt.name, opt.value()) for name, opt in self._options.items())
 
     def define(self, name, default=None, type=None, help=None, metavar=None,
                multiple=False, group=None, callback=None):
         """Defines a new command line option.
 
-        If ``type`` is given (one of str, float, int, datetime, or timedelta)
-        or can be inferred from the ``default``, we parse the command line
-        arguments based on the given type. If ``multiple`` is True, we accept
-        comma-separated values, and the option value is always a list.
+        ``type`` can be any of `str`, `int`, `float`, `bool`,
+        `~datetime.datetime`, or `~datetime.timedelta`. If no ``type``
+        is given but a ``default`` is, ``type`` is the type of
+        ``default``. Otherwise, ``type`` defaults to `str`.
 
-        For multi-value integers, we also accept the syntax ``x:y``, which
-        turns into ``range(x, y)`` - very useful for long integer ranges.
+        If ``multiple`` is True, the option value is a list of ``type``
+        instead of an instance of ``type``.
 
         ``help`` and ``metavar`` are used to construct the
         automatically generated command line help string. The help
@@ -184,9 +221,7 @@ class OptionParser(object):
         groups. By default, command line options are grouped by the
         file in which they are defined.
 
-        Command line option names must be unique globally. They can be parsed
-        from the command line with `parse_command_line` or parsed from a
-        config file with `parse_config_file`.
+        Command line option names must be unique globally.
 
         If a ``callback`` is given, it will be run with the new value whenever
         the option is changed.  This can be used to combine command-line
@@ -198,12 +233,21 @@ class OptionParser(object):
         With this definition, options in the file specified by ``--config`` will
         override options set earlier on the command line, but can be overridden
         by later flags.
+
         """
-        if name in self._options:
+        normalized = self._normalize_name(name)
+        if normalized in self._options:
             raise Error("Option %r already defined in %s" %
-                        (name, self._options[name].file_name))
+                        (normalized, self._options[normalized].file_name))
         frame = sys._getframe(0)
         options_file = frame.f_code.co_filename
+
+        # Can be called directly, or through top level define() fn, in which
+        # case, step up above that frame to look for real caller.
+        if (frame.f_back.f_code.co_filename == options_file and
+                frame.f_back.f_code.co_name == 'define'):
+            frame = frame.f_back
+
         file_name = frame.f_back.f_code.co_filename
         if file_name == options_file:
             file_name = ""
@@ -216,15 +260,24 @@ class OptionParser(object):
             group_name = group
         else:
             group_name = file_name
-        self._options[name] = _Option(name, file_name=file_name,
-                                      default=default, type=type, help=help,
-                                      metavar=metavar, multiple=multiple,
-                                      group_name=group_name,
-                                      callback=callback)
+        option = _Option(name, file_name=file_name,
+                         default=default, type=type, help=help,
+                         metavar=metavar, multiple=multiple,
+                         group_name=group_name,
+                         callback=callback)
+        self._options[normalized] = option
 
     def parse_command_line(self, args=None, final=True):
         """Parses all options given on the command line (defaults to
         `sys.argv`).
+
+        Options look like ``--option=value`` and are parsed according
+        to their ``type``. For boolean options, ``--option`` is
+        equivalent to ``--option=true``
+
+        If the option has ``multiple=True``, comma-separated values
+        are accepted. For multi-value integer options, the syntax
+        ``x:y`` is also accepted and equivalent to ``range(x, y)``.
 
         Note that ``args[0]`` is ignored since it is the program name
         in `sys.argv`.
@@ -234,6 +287,7 @@ class OptionParser(object):
         If ``final`` is ``False``, parse callbacks will not be run.
         This is useful for applications that wish to combine configurations
         from multiple sources.
+
         """
         if args is None:
             args = sys.argv
@@ -248,8 +302,8 @@ class OptionParser(object):
                 break
             arg = args[i].lstrip("-")
             name, equals, value = arg.partition("=")
-            name = name.replace('-', '_')
-            if not name in self._options:
+            name = self._normalize_name(name)
+            if name not in self._options:
                 self.print_help()
                 raise Error('Unrecognized command line option: %r' % name)
             option = self._options[name]
@@ -266,18 +320,53 @@ class OptionParser(object):
         return remaining
 
     def parse_config_file(self, path, final=True):
-        """Parses and loads the Python config file at the given path.
+        """Parses and loads the config file at the given path.
+
+        The config file contains Python code that will be executed (so
+        it is **not safe** to use untrusted config files). Anything in
+        the global namespace that matches a defined option will be
+        used to set that option's value.
+
+        Options are not parsed from strings as they would be on the
+        command line; they should be set to the correct type (this
+        means if you have ``datetime`` or ``timedelta`` options you
+        will need to import those modules in the config file.
+
+        Example (using the options defined in the top-level docs of
+        this module)::
+
+            port = 80
+            mysql_host = 'mydb.example.com:3306'
+            memcache_hosts = ['cache1.example.com:11011',
+                              'cache2.example.com:11011']
 
         If ``final`` is ``False``, parse callbacks will not be run.
         This is useful for applications that wish to combine configurations
         from multiple sources.
+
+        .. note::
+
+            `tornado.options` is primarily a command-line library.
+            Config file support is provided for applications that wish
+            to use it, but applications that prefer config files may
+            wish to look at other libraries instead.
+
+        .. versionchanged:: 4.1
+           Config files are now always interpreted as utf-8 instead of
+           the system default encoding.
+
+        .. versionchanged:: 4.4
+           The special variable ``__file__`` is available inside config
+           files, specifying the absolute path to the config file itself.
+
         """
-        config = {}
-        with open(path) as f:
-            exec_in(f.read(), config, config)
+        config = {'__file__': os.path.abspath(path)}
+        with open(path, 'rb') as f:
+            exec_in(native_str(f.read()), config, config)
         for name in config:
-            if name in self._options:
-                self._options[name].set(config[name])
+            normalized = self._normalize_name(name)
+            if normalized in self._options:
+                self._options[normalized].set(config[name])
 
         if final:
             self.run_parse_callbacks()
@@ -297,7 +386,8 @@ class OptionParser(object):
                 print("\n%s options:\n" % os.path.normpath(filename), file=file)
             o.sort(key=lambda option: option.name)
             for option in o:
-                prefix = option.name
+                # Always print names with dashes in a CLI context.
+                prefix = self._normalize_name(option.name)
                 if option.metavar:
                     prefix += "=" + option.metavar
                 description = option.help or ""
@@ -456,19 +546,17 @@ class _Option(object):
                 pass
         raise Error('Unrecognized date/time format: %r' % value)
 
-    _TIMEDELTA_ABBREVS = [
-        ('hours', ['h']),
-        ('minutes', ['m', 'min']),
-        ('seconds', ['s', 'sec']),
-        ('milliseconds', ['ms']),
-        ('microseconds', ['us']),
-        ('days', ['d']),
-        ('weeks', ['w']),
-    ]
-
-    _TIMEDELTA_ABBREV_DICT = dict(
-        (abbrev, full) for full, abbrevs in _TIMEDELTA_ABBREVS
-        for abbrev in abbrevs)
+    _TIMEDELTA_ABBREV_DICT = {
+        'h': 'hours',
+        'm': 'minutes',
+        'min': 'minutes',
+        's': 'seconds',
+        'sec': 'seconds',
+        'ms': 'milliseconds',
+        'us': 'microseconds',
+        'd': 'days',
+        'w': 'weeks',
+    }
 
     _FLOAT_PATTERN = r'[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?'
 

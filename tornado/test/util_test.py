@@ -1,15 +1,21 @@
 # coding: utf-8
-from __future__ import absolute_import, division, print_function, with_statement
+from __future__ import absolute_import, division, print_function
+import re
 import sys
+import datetime
 
+import tornado.escape
 from tornado.escape import utf8
-from tornado.util import raise_exc_info, Configurable, u, exec_in, ArgReplacer
 from tornado.test.util import unittest
+from tornado.util import (
+    raise_exc_info, Configurable, exec_in, ArgReplacer,
+    timedelta_to_seconds, import_object, re_unescape, is_finalizing, PY3,
+)
 
-try:
-    from cStringIO import StringIO  # py2
-except ImportError:
-    from io import StringIO  # py3
+if PY3:
+    from io import StringIO
+else:
+    from cStringIO import StringIO
 
 
 class RaiseExcInfoTest(unittest.TestCase):
@@ -44,11 +50,34 @@ class TestConfigurable(Configurable):
 
 
 class TestConfig1(TestConfigurable):
+    def initialize(self, pos_arg=None, a=None):
+        self.a = a
+        self.pos_arg = pos_arg
+
+
+class TestConfig2(TestConfigurable):
+    def initialize(self, pos_arg=None, b=None):
+        self.b = b
+        self.pos_arg = pos_arg
+
+
+class TestConfig3(TestConfigurable):
+    # TestConfig3 is a configuration option that is itself configurable.
+    @classmethod
+    def configurable_base(cls):
+        return TestConfig3
+
+    @classmethod
+    def configurable_default(cls):
+        return TestConfig3A
+
+
+class TestConfig3A(TestConfig3):
     def initialize(self, a=None):
         self.a = a
 
 
-class TestConfig2(TestConfigurable):
+class TestConfig3B(TestConfig3):
     def initialize(self, b=None):
         self.b = b
 
@@ -56,9 +85,11 @@ class TestConfig2(TestConfigurable):
 class ConfigurableTest(unittest.TestCase):
     def setUp(self):
         self.saved = TestConfigurable._save_configuration()
+        self.saved3 = TestConfig3._save_configuration()
 
     def tearDown(self):
         TestConfigurable._restore_configuration(self.saved)
+        TestConfig3._restore_configuration(self.saved3)
 
     def checkSubclasses(self):
         # no matter how the class is configured, it should always be
@@ -100,9 +131,10 @@ class ConfigurableTest(unittest.TestCase):
         self.assertIsInstance(obj, TestConfig1)
         self.assertEqual(obj.a, 3)
 
-        obj = TestConfigurable(a=4)
+        obj = TestConfigurable(42, a=4)
         self.assertIsInstance(obj, TestConfig1)
         self.assertEqual(obj.a, 4)
+        self.assertEqual(obj.pos_arg, 42)
 
         self.checkSubclasses()
         # args bound in configure don't apply when using the subclass directly
@@ -115,19 +147,53 @@ class ConfigurableTest(unittest.TestCase):
         self.assertIsInstance(obj, TestConfig2)
         self.assertEqual(obj.b, 5)
 
-        obj = TestConfigurable(b=6)
+        obj = TestConfigurable(42, b=6)
         self.assertIsInstance(obj, TestConfig2)
         self.assertEqual(obj.b, 6)
+        self.assertEqual(obj.pos_arg, 42)
 
         self.checkSubclasses()
         # args bound in configure don't apply when using the subclass directly
         obj = TestConfig2()
         self.assertIs(obj.b, None)
 
+    def test_config_multi_level(self):
+        TestConfigurable.configure(TestConfig3, a=1)
+        obj = TestConfigurable()
+        self.assertIsInstance(obj, TestConfig3A)
+        self.assertEqual(obj.a, 1)
+
+        TestConfigurable.configure(TestConfig3)
+        TestConfig3.configure(TestConfig3B, b=2)
+        obj = TestConfigurable()
+        self.assertIsInstance(obj, TestConfig3B)
+        self.assertEqual(obj.b, 2)
+
+    def test_config_inner_level(self):
+        # The inner level can be used even when the outer level
+        # doesn't point to it.
+        obj = TestConfig3()
+        self.assertIsInstance(obj, TestConfig3A)
+
+        TestConfig3.configure(TestConfig3B)
+        obj = TestConfig3()
+        self.assertIsInstance(obj, TestConfig3B)
+
+        # Configuring the base doesn't configure the inner.
+        obj = TestConfigurable()
+        self.assertIsInstance(obj, TestConfig1)
+        TestConfigurable.configure(TestConfig2)
+
+        obj = TestConfigurable()
+        self.assertIsInstance(obj, TestConfig2)
+
+        obj = TestConfig3()
+        self.assertIsInstance(obj, TestConfig3B)
+
 
 class UnicodeLiteralTest(unittest.TestCase):
     def test_unicode_escapes(self):
-        self.assertEqual(utf8(u('\u00e9')), b'\xc3\xa9')
+        self.assertEqual(utf8(u'\u00e9'), b'\xc3\xa9')
 
 
 class ExecInTest(unittest.TestCase):
@@ -170,3 +236,51 @@ class ArgReplacerTest(unittest.TestCase):
         self.assertEqual(self.replacer.get_old_value(args, kwargs), 'old')
         self.assertEqual(self.replacer.replace('new', args, kwargs),
                          ('old', (1,), dict(y=2, callback='new', z=3)))
+
+
+class TimedeltaToSecondsTest(unittest.TestCase):
+    def test_timedelta_to_seconds(self):
+        time_delta = datetime.timedelta(hours=1)
+        self.assertEqual(timedelta_to_seconds(time_delta), 3600.0)
+
+
+class ImportObjectTest(unittest.TestCase):
+    def test_import_member(self):
+        self.assertIs(import_object('tornado.escape.utf8'), utf8)
+
+    def test_import_member_unicode(self):
+        self.assertIs(import_object(u'tornado.escape.utf8'), utf8)
+
+    def test_import_module(self):
+        self.assertIs(import_object('tornado.escape'), tornado.escape)
+
+    def test_import_module_unicode(self):
+        # The internal implementation of __import__ differs depending on
+        # whether the thing being imported is a module or not.
+        # This variant requires a byte string in python 2.
+        self.assertIs(import_object(u'tornado.escape'), tornado.escape)
+
+
+class ReUnescapeTest(unittest.TestCase):
+    def test_re_unescape(self):
+        test_strings = (
+            '/favicon.ico',
+            'index.html',
+            'Hello, World!',
+            '!$@#%;',
+        )
+        for string in test_strings:
+            self.assertEqual(string, re_unescape(re.escape(string)))
+
+    def test_re_unescape_raises_error_on_invalid_input(self):
+        with self.assertRaises(ValueError):
+            re_unescape('\\d')
+        with self.assertRaises(ValueError):
+            re_unescape('\\b')
+        with self.assertRaises(ValueError):
+            re_unescape('\\Z')
+
+
+class IsFinalizingTest(unittest.TestCase):
+    def test_basic(self):
+        self.assertFalse(is_finalizing())

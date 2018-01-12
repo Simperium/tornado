@@ -1,4 +1,4 @@
-from __future__ import absolute_import, division, print_function, with_statement
+from __future__ import absolute_import, division, print_function
 
 import os
 import sys
@@ -6,8 +6,8 @@ import traceback
 
 from tornado.escape import utf8, native_str, to_unicode
 from tornado.template import Template, DictLoader, ParseError, Loader
-from tornado.test.util import unittest
-from tornado.util import u, bytes_type, ObjectDict, unicode_type
+from tornado.test.util import unittest, is_coverage_running
+from tornado.util import ObjectDict, unicode_type, PY3
 
 
 class TemplateTest(unittest.TestCase):
@@ -67,12 +67,13 @@ class TemplateTest(unittest.TestCase):
         self.assertRaises(ParseError, lambda: Template("{%"))
         self.assertEqual(Template("{{!").generate(), b"{{")
         self.assertEqual(Template("{%!").generate(), b"{%")
+        self.assertEqual(Template("{#!").generate(), b"{#")
         self.assertEqual(Template("{{ 'expr' }} {{!jquery expr}}").generate(),
                          b"expr {{jquery expr}}")
 
     def test_unicode_template(self):
-        template = Template(utf8(u("\u00e9")))
-        self.assertEqual(template.generate(), utf8(u("\u00e9")))
+        template = Template(utf8(u"\u00e9"))
+        self.assertEqual(template.generate(), utf8(u"\u00e9"))
 
     def test_unicode_literal_expression(self):
         # Unicode literals should be usable in templates.  Note that this
@@ -82,10 +83,10 @@ class TemplateTest(unittest.TestCase):
         if str is unicode_type:
             # python 3 needs a different version of this test since
             # 2to3 doesn't run on template internals
-            template = Template(utf8(u('{{ "\u00e9" }}')))
+            template = Template(utf8(u'{{ "\u00e9" }}'))
         else:
-            template = Template(utf8(u('{{ u"\u00e9" }}')))
-        self.assertEqual(template.generate(), utf8(u("\u00e9")))
+            template = Template(utf8(u'{{ u"\u00e9" }}'))
+        self.assertEqual(template.generate(), utf8(u"\u00e9"))
 
     def test_custom_namespace(self):
         loader = DictLoader({"test.html": "{{ inc(5) }}"}, namespace={"inc": lambda x: x + 1})
@@ -100,14 +101,14 @@ class TemplateTest(unittest.TestCase):
     def test_unicode_apply(self):
         def upper(s):
             return to_unicode(s).upper()
-        template = Template(utf8(u("{% apply upper %}foo \u00e9{% end %}")))
-        self.assertEqual(template.generate(upper=upper), utf8(u("FOO \u00c9")))
+        template = Template(utf8(u"{% apply upper %}foo \u00e9{% end %}"))
+        self.assertEqual(template.generate(upper=upper), utf8(u"FOO \u00c9"))
 
     def test_bytes_apply(self):
         def upper(s):
             return utf8(to_unicode(s).upper())
-        template = Template(utf8(u("{% apply upper %}foo \u00e9{% end %}")))
-        self.assertEqual(template.generate(upper=upper), utf8(u("FOO \u00c9")))
+        template = Template(utf8(u"{% apply upper %}foo \u00e9{% end %}"))
+        self.assertEqual(template.generate(upper=upper), utf8(u"FOO \u00c9"))
 
     def test_if(self):
         template = Template(utf8("{% if x > 4 %}yes{% else %}no{% end %}"))
@@ -173,6 +174,15 @@ try{% set y = 1/x %}
         template = Template('{{ 1 / 2 }}')
         self.assertEqual(template.generate(), '0')
 
+    def test_non_ascii_name(self):
+        if PY3 and is_coverage_running():
+            try:
+                os.fsencode(u"t\u00e9st.html")
+            except UnicodeEncodeError:
+                self.skipTest("coverage tries to access unencodable filename")
+        loader = DictLoader({u"t\u00e9st.html": "hello"})
+        self.assertEqual(loader.load(u"t\u00e9st.html").generate(), b"hello")
+
 
 class StackTraceTest(unittest.TestCase):
     def test_error_line_number_expression(self):
@@ -182,6 +192,7 @@ three
         """})
         try:
             loader.load("test.html").generate()
+            self.fail("did not get expected exception")
         except ZeroDivisionError:
             self.assertTrue("# test.html:2" in traceback.format_exc())
 
@@ -192,16 +203,23 @@ three{%end%}
         """})
         try:
             loader.load("test.html").generate()
+            self.fail("did not get expected exception")
         except ZeroDivisionError:
             self.assertTrue("# test.html:2" in traceback.format_exc())
 
     def test_error_line_number_module(self):
+        loader = None
+
+        def load_generate(path, **kwargs):
+            return loader.load(path).generate(**kwargs)
+
         loader = DictLoader({
             "base.html": "{% module Template('sub.html') %}",
             "sub.html": "{{1/0}}",
-        }, namespace={"_tt_modules": ObjectDict({"Template": lambda path, **kwargs: loader.load(path).generate(**kwargs)})})
+        }, namespace={"_tt_modules": ObjectDict(Template=load_generate)})
         try:
             loader.load("base.html").generate()
+            self.fail("did not get expected exception")
         except ZeroDivisionError:
             exc_stack = traceback.format_exc()
             self.assertTrue('# base.html:1' in exc_stack)
@@ -214,6 +232,7 @@ three{%end%}
         })
         try:
             loader.load("base.html").generate()
+            self.fail("did not get expected exception")
         except ZeroDivisionError:
             self.assertTrue("# sub.html:1 (via base.html:1)" in
                             traceback.format_exc())
@@ -225,6 +244,7 @@ three{%end%}
         })
         try:
             loader.load("sub.html").generate()
+            self.fail("did not get expected exception")
         except ZeroDivisionError:
             exc_stack = traceback.format_exc()
         self.assertTrue("# base.html:1" in exc_stack)
@@ -240,6 +260,7 @@ three{%end%}
             """})
         try:
             loader.load("sub.html").generate()
+            self.fail("did not get expected exception")
         except ZeroDivisionError:
             self.assertTrue("# sub.html:4 (via base.html:1)" in
                             traceback.format_exc())
@@ -252,9 +273,28 @@ three{%end%}
         })
         try:
             loader.load("a.html").generate()
+            self.fail("did not get expected exception")
         except ZeroDivisionError:
             self.assertTrue("# c.html:1 (via b.html:1, a.html:1)" in
                             traceback.format_exc())
+
+
+class ParseErrorDetailTest(unittest.TestCase):
+    def test_details(self):
+        loader = DictLoader({
+            "foo.html": "\n\n{{",
+        })
+        with self.assertRaises(ParseError) as cm:
+            loader.load("foo.html")
+        self.assertEqual("Missing end expression }} at foo.html:3",
+                         str(cm.exception))
+        self.assertEqual("foo.html", cm.exception.filename)
+        self.assertEqual(3, cm.exception.lineno)
+
+    def test_custom_parse_error(self):
+        # Make sure that ParseErrors remain compatible with their
+        # pre-4.3 signature.
+        self.assertEqual("asdf at None:0", str(ParseError("asdf")))
 
 
 class AutoEscapeTest(unittest.TestCase):
@@ -367,7 +407,7 @@ raw: {% raw name %}""",
                              "{% autoescape py_escape %}s = {{ name }}\n"})
 
         def py_escape(s):
-            self.assertEqual(type(s), bytes_type)
+            self.assertEqual(type(s), bytes)
             return repr(native_str(s))
 
         def render(template, name):
@@ -380,6 +420,76 @@ raw: {% raw name %}""",
         self.assertEqual(render("foo.py", ["not a string"]),
                          b"""s = "['not a string']"\n""")
 
+    def test_manual_minimize_whitespace(self):
+        # Whitespace including newlines is allowed within template tags
+        # and directives, and this is one way to avoid long lines while
+        # keeping extra whitespace out of the rendered output.
+        loader = DictLoader({'foo.txt': """\
+{% for i in items
+  %}{% if i > 0 %}, {% end %}{#
+  #}{{i
+  }}{% end
+%}""",
+                             })
+        self.assertEqual(loader.load("foo.txt").generate(items=range(5)),
+                         b"0, 1, 2, 3, 4")
+
+    def test_whitespace_by_filename(self):
+        # Default whitespace handling depends on the template filename.
+        loader = DictLoader({
+            "foo.html": "   \n\t\n asdf\t   ",
+            "bar.js": " \n\n\n\t qwer     ",
+            "baz.txt": "\t    zxcv\n\n",
+            "include.html": "  {% include baz.txt %} \n ",
+            "include.txt": "\t\t{% include foo.html %}    ",
+        })
+
+        # HTML and JS files have whitespace compressed by default.
+        self.assertEqual(loader.load("foo.html").generate(),
+                         b"\nasdf ")
+        self.assertEqual(loader.load("bar.js").generate(),
+                         b"\nqwer ")
+        # TXT files do not.
+        self.assertEqual(loader.load("baz.txt").generate(),
+                         b"\t    zxcv\n\n")
+
+        # Each file maintains its own status even when included in
+        # a file of the other type.
+        self.assertEqual(loader.load("include.html").generate(),
+                         b" \t    zxcv\n\n\n")
+        self.assertEqual(loader.load("include.txt").generate(),
+                         b"\t\t\nasdf     ")
+
+    def test_whitespace_by_loader(self):
+        templates = {
+            "foo.html": "\t\tfoo\n\n",
+            "bar.txt": "\t\tbar\n\n",
+        }
+        loader = DictLoader(templates, whitespace='all')
+        self.assertEqual(loader.load("foo.html").generate(), b"\t\tfoo\n\n")
+        self.assertEqual(loader.load("bar.txt").generate(), b"\t\tbar\n\n")
+
+        loader = DictLoader(templates, whitespace='single')
+        self.assertEqual(loader.load("foo.html").generate(), b" foo\n")
+        self.assertEqual(loader.load("bar.txt").generate(), b" bar\n")
+
+        loader = DictLoader(templates, whitespace='oneline')
+        self.assertEqual(loader.load("foo.html").generate(), b" foo ")
+        self.assertEqual(loader.load("bar.txt").generate(), b" bar ")
+
+    def test_whitespace_directive(self):
+        loader = DictLoader({
+            "foo.html": """\
+{% whitespace oneline %}
+    {% for i in range(3) %}
+        {{ i }}
+    {% end %}
+{% whitespace all %}
+    pre\tformatted
+"""})
+        self.assertEqual(loader.load("foo.html").generate(),
+                         b"  0  1  2  \n    pre\tformatted\n")
+
 
 class TemplateLoaderTest(unittest.TestCase):
     def setUp(self):
@@ -388,4 +498,4 @@ class TemplateLoaderTest(unittest.TestCase):
     def test_utf8_in_file(self):
         tmpl = self.loader.load("utf8.html")
         result = tmpl.generate()
-        self.assertEqual(to_unicode(result).strip(), u("H\u00e9llo"))
+        self.assertEqual(to_unicode(result).strip(), u"H\u00e9llo")

@@ -1,23 +1,25 @@
-from __future__ import absolute_import, division, print_function, with_statement
+# -*- coding: utf-8 -*-
+from __future__ import absolute_import, division, print_function
 
 import datetime
 import os
 import sys
 
 from tornado.options import OptionParser, Error
-from tornado.util import basestring_type
-from tornado.test.util import unittest
+from tornado.util import basestring_type, PY3
+from tornado.test.util import unittest, subTest
+
+if PY3:
+    from io import StringIO
+else:
+    from cStringIO import StringIO
 
 try:
-    from cStringIO import StringIO  # python 2
-except ImportError:
-    from io import StringIO  # python 3
-
-try:
-    from unittest import mock  # python 3.3
+    # py33+
+    from unittest import mock  # type: ignore
 except ImportError:
     try:
-        import mock  # third-party mock package
+        import mock  # type: ignore
     except ImportError:
         mock = None
 
@@ -32,9 +34,14 @@ class OptionsTest(unittest.TestCase):
     def test_parse_config_file(self):
         options = OptionParser()
         options.define("port", default=80)
-        options.parse_config_file(os.path.join(os.path.dirname(__file__),
-                                               "options_test.cfg"))
-        self.assertEquals(options.port, 443)
+        options.define("username", default='foo')
+        options.define("my_path")
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "options_test.cfg")
+        options.parse_config_file(config_path)
+        self.assertEqual(options.port, 443)
+        self.assertEqual(options.username, "李康")
+        self.assertEqual(options.my_path, config_path)
 
     def test_parse_callbacks(self):
         options = OptionParser()
@@ -128,6 +135,12 @@ class OptionsTest(unittest.TestCase):
         options = self._sample_options()
         self.assertEqual(1, options['a'])
 
+    def test_setitem(self):
+        options = OptionParser()
+        options.define('foo', default=1, type=int)
+        options['foo'] = 2
+        self.assertEqual(options['foo'], 2)
+
     def test_items(self):
         options = self._sample_options()
         # OptionParsers always define 'help'.
@@ -218,3 +231,63 @@ class OptionsTest(unittest.TestCase):
             options.define('foo')
         self.assertRegexpMatches(str(cm.exception),
                                  'Option.*foo.*already defined')
+
+    def test_error_redefine_underscore(self):
+        # Ensure that the dash/underscore normalization doesn't
+        # interfere with the redefinition error.
+        tests = [
+            ('foo-bar', 'foo-bar'),
+            ('foo_bar', 'foo_bar'),
+            ('foo-bar', 'foo_bar'),
+            ('foo_bar', 'foo-bar'),
+        ]
+        for a, b in tests:
+            with subTest(self, a=a, b=b):
+                options = OptionParser()
+                options.define(a)
+                with self.assertRaises(Error) as cm:
+                    options.define(b)
+                self.assertRegexpMatches(str(cm.exception),
+                                         'Option.*foo.bar.*already defined')
+
+    def test_dash_underscore_cli(self):
+        # Dashes and underscores should be interchangeable.
+        for defined_name in ['foo-bar', 'foo_bar']:
+            for flag in ['--foo-bar=a', '--foo_bar=a']:
+                options = OptionParser()
+                options.define(defined_name)
+                options.parse_command_line(['main.py', flag])
+                # Attr-style access always uses underscores.
+                self.assertEqual(options.foo_bar, 'a')
+                # Dict-style access allows both.
+                self.assertEqual(options['foo-bar'], 'a')
+                self.assertEqual(options['foo_bar'], 'a')
+
+    def test_dash_underscore_file(self):
+        # No matter how an option was defined, it can be set with underscores
+        # in a config file.
+        for defined_name in ['foo-bar', 'foo_bar']:
+            options = OptionParser()
+            options.define(defined_name)
+            options.parse_config_file(os.path.join(os.path.dirname(__file__),
+                                                   "options_test.cfg"))
+            self.assertEqual(options.foo_bar, 'a')
+
+    def test_dash_underscore_introspection(self):
+        # Original names are preserved in introspection APIs.
+        options = OptionParser()
+        options.define('with-dash', group='g')
+        options.define('with_underscore', group='g')
+        all_options = ['help', 'with-dash', 'with_underscore']
+        self.assertEqual(sorted(options), all_options)
+        self.assertEqual(sorted(k for (k, v) in options.items()), all_options)
+        self.assertEqual(sorted(options.as_dict().keys()), all_options)
+
+        self.assertEqual(sorted(options.group_dict('g')),
+                         ['with-dash', 'with_underscore'])
+
+        # --help shows CLI-style names with dashes.
+        buf = StringIO()
+        options.print_help(buf)
+        self.assertIn('--with-dash', buf.getvalue())
+        self.assertIn('--with-underscore', buf.getvalue())

@@ -39,6 +39,7 @@ define('cookie_secret', type=str, group='application',
        default='__TODO:_GENERATE_YOUR_OWN_RANDOM_VALUE__',
        help="signing key for secure cookies")
 
+
 class BaseHandler(RequestHandler):
     COOKIE_NAME = 'twitterdemo_user'
 
@@ -47,6 +48,7 @@ class BaseHandler(RequestHandler):
         if not user_json:
             return None
         return json_decode(user_json)
+
 
 class MainHandler(BaseHandler, TwitterMixin):
     @authenticated
@@ -57,19 +59,23 @@ class MainHandler(BaseHandler, TwitterMixin):
             access_token=self.current_user['access_token'])
         self.render('home.html', timeline=timeline)
 
+
 class LoginHandler(BaseHandler, TwitterMixin):
     @gen.coroutine
     def get(self):
         if self.get_argument('oauth_token', None):
             user = yield self.get_authenticated_user()
+            del user["description"]
             self.set_secure_cookie(self.COOKIE_NAME, json_encode(user))
             self.redirect(self.get_argument('next', '/'))
         else:
             yield self.authorize_redirect(callback_uri=self.request.full_url())
 
+
 class LogoutHandler(BaseHandler):
     def get(self):
         self.clear_cookie(self.COOKIE_NAME)
+
 
 def main():
     parse_command_line(final=False)
@@ -86,7 +92,8 @@ def main():
     app.listen(options.port)
 
     logging.info('Listening on http://localhost:%d' % options.port)
-    IOLoop.instance().start()
+    IOLoop.current().start()
+
 
 if __name__ == '__main__':
     main()

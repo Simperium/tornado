@@ -17,7 +17,7 @@
 
 Used as a fallback for systems that don't support epoll or kqueue.
 """
-from __future__ import absolute_import, division, print_function, with_statement
+from __future__ import absolute_import, division, print_function
 
 import select
 
@@ -47,7 +47,7 @@ class _Select(object):
             # Closed connections are reported as errors by epoll and kqueue,
             # but as zero-byte reads by select, so when errors are requested
             # we need to listen for both read and error.
-            self.read_fds.add(fd)
+            # self.read_fds.add(fd)
 
     def modify(self, fd, events):
         self.unregister(fd)

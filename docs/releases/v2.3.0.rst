@@ -30,7 +30,7 @@ HTTP Server
 * `.HTTPServer` now works correctly with paths starting with ``//``
 * ``HTTPHeaders.copy`` (inherited from `dict.copy`) now works correctly.
 * ``HTTPConnection.address`` is now always the socket address, even for non-IP
-  sockets.  `.HTTPRequest.remote_ip` is still always an IP-style address
+  sockets.  ``HTTPRequest.remote_ip`` is still always an IP-style address
   (fake data is used for non-IP sockets)
 * Extra data at the end of multipart form bodies is now ignored, which fixes
   a compatibility problem with an iOS HTTP client library.
@@ -80,7 +80,7 @@ HTTP Server
   backwards-incompatible change to an interface that was never technically
   private, but was not included in the documentation and does not appear
   to have been used outside Tornado itself.
-* Fixed a bug on python versions before 2.6.5 when `.URLSpec` regexes
+* Fixed a bug on python versions before 2.6.5 when `tornado.web.URLSpec` regexes
   are constructed from unicode strings and keyword arguments are extracted.
 * The ``reverse_url`` function in the template namespace now comes from
   the `.RequestHandler` rather than the `.Application`.  (Unless overridden,

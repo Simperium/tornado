@@ -41,13 +41,13 @@ Example usage::
             sys.exit(1)
 
     with StackContext(die_on_error):
-        # Any exception thrown here *or in callback and its desendents*
+        # Any exception thrown here *or in callback and its descendants*
         # will cause the process to exit instead of spinning endlessly
         # in the ioloop.
         http_client.fetch(url, callback)
     ioloop.start()
 
-Most applications shouln't have to work with `StackContext` directly.
+Most applications shouldn't have to work with `StackContext` directly.
 Here are a few rules of thumb for when it's necessary:
 
 * If you're writing an asynchronous library that doesn't rely on a
@@ -67,7 +67,7 @@ Here are a few rules of thumb for when it's necessary:
   block that references your `StackContext`.
 """
 
-from __future__ import absolute_import, division, print_function, with_statement
+from __future__ import absolute_import, division, print_function
 
 import sys
 import threading
@@ -82,6 +82,8 @@ class StackContextInconsistentError(Exception):
 class _State(threading.local):
     def __init__(self):
         self.contexts = (tuple(), None)
+
+
 _state = _State()
 
 

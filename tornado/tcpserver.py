@@ -15,34 +15,56 @@
 # under the License.
 
 """A non-blocking, single-threaded TCP server."""
-from __future__ import absolute_import, division, print_function, with_statement
+from __future__ import absolute_import, division, print_function
 
 import errno
 import os
 import socket
-import ssl
 
+from tornado import gen
 from tornado.log import app_log
 from tornado.ioloop import IOLoop
 from tornado.iostream import IOStream, SSLIOStream
 from tornado.netutil import bind_sockets, add_accept_handler, ssl_wrap_socket
 from tornado import process
+from tornado.util import errno_from_exception
+
+try:
+    import ssl
+except ImportError:
+    # ssl is not available on Google App Engine.
+    ssl = None
 
 
 class TCPServer(object):
     r"""A non-blocking, single-threaded TCP server.
 
     To use `TCPServer`, define a subclass which overrides the `handle_stream`
-    method.
+    method. For example, a simple echo server could be defined like this::
 
-    To make this server serve SSL traffic, send the ssl_options dictionary
-    argument with the arguments required for the `ssl.wrap_socket` method,
-    including "certfile" and "keyfile"::
+      from tornado.tcpserver import TCPServer
+      from tornado.iostream import StreamClosedError
+      from tornado import gen
 
-       TCPServer(ssl_options={
-           "certfile": os.path.join(data_dir, "mydomain.crt"),
-           "keyfile": os.path.join(data_dir, "mydomain.key"),
-       })
+      class EchoServer(TCPServer):
+          @gen.coroutine
+          def handle_stream(self, stream, address):
+              while True:
+                  try:
+                      data = yield stream.read_until(b"\n")
+                      yield stream.write(data)
+                  except StreamClosedError:
+                      break
+
+    To make this server serve SSL traffic, send the ``ssl_options`` keyword
+    argument with an `ssl.SSLContext` object. For compatibility with older
+    versions of Python ``ssl_options`` may also be a dictionary of keyword
+    arguments for the `ssl.wrap_socket` method.::
+
+       ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+       ssl_ctx.load_cert_chain(os.path.join(data_dir, "mydomain.crt"),
+                               os.path.join(data_dir, "mydomain.key"))
+       TCPServer(ssl_options=ssl_ctx)
 
     `TCPServer` initialization follows one of three patterns:
 
@@ -50,14 +72,14 @@ class TCPServer(object):
 
             server = TCPServer()
             server.listen(8888)
-            IOLoop.instance().start()
+            IOLoop.current().start()
 
     2. `bind`/`start`: simple multi-process::
 
             server = TCPServer()
             server.bind(8888)
             server.start(0)  # Forks multiple sub-processes
-            IOLoop.instance().start()
+            IOLoop.current().start()
 
        When using this interface, an `.IOLoop` must *not* be passed
        to the `TCPServer` constructor.  `start` will always start
@@ -69,7 +91,7 @@ class TCPServer(object):
             tornado.process.fork_processes(0)
             server = TCPServer()
             server.add_sockets(sockets)
-            IOLoop.instance().start()
+            IOLoop.current().start()
 
        The `add_sockets` interface is more complicated, but it can be
        used with `tornado.process.fork_processes` to give you more
@@ -80,14 +102,20 @@ class TCPServer(object):
 
     .. versionadded:: 3.1
        The ``max_buffer_size`` argument.
+
+    .. versionchanged:: 5.0
+       The ``io_loop`` argument has been removed.
     """
-    def __init__(self, io_loop=None, ssl_options=None, max_buffer_size=None):
-        self.io_loop = io_loop
+    def __init__(self, ssl_options=None, max_buffer_size=None,
+                 read_chunk_size=None):
         self.ssl_options = ssl_options
-        self._sockets = {}  # fd -> socket object
+        self._sockets = {}   # fd -> socket object
+        self._handlers = {}  # fd -> remove_handler callable
         self._pending_sockets = []
         self._started = False
+        self._stopped = False
         self.max_buffer_size = max_buffer_size
+        self.read_chunk_size = read_chunk_size
 
         # Verify the SSL options. Otherwise we don't get errors until clients
         # connect. This doesn't verify that the keys are legitimate, but
@@ -126,19 +154,17 @@ class TCPServer(object):
         method and `tornado.process.fork_processes` to provide greater
         control over the initialization of a multi-process server.
         """
-        if self.io_loop is None:
-            self.io_loop = IOLoop.current()
-
         for sock in sockets:
             self._sockets[sock.fileno()] = sock
-            add_accept_handler(sock, self._handle_connection,
-                               io_loop=self.io_loop)
+            self._handlers[sock.fileno()] = add_accept_handler(
+                sock, self._handle_connection)
 
     def add_socket(self, socket):
         """Singular version of `add_sockets`.  Takes a single socket object."""
         self.add_sockets([socket])
 
-    def bind(self, port, address=None, family=socket.AF_UNSPEC, backlog=128):
+    def bind(self, port, address=None, family=socket.AF_UNSPEC, backlog=128,
+             reuse_port=False):
         """Binds this server to the given port on the given address.
 
         To start the server, call `start`. If you want to run this server
@@ -153,13 +179,17 @@ class TCPServer(object):
         both will be used if available.
 
         The ``backlog`` argument has the same meaning as for
-        `socket.listen <socket.socket.listen>`.
+        `socket.listen <socket.socket.listen>`. The ``reuse_port`` argument
+        has the same meaning as for `.bind_sockets`.
 
         This method may be called multiple times prior to `start` to listen
         on multiple ports or interfaces.
+
+        .. versionchanged:: 4.4
+           Added the ``reuse_port`` argument.
         """
         sockets = bind_sockets(port, address=address, family=family,
-                               backlog=backlog)
+                               backlog=backlog, reuse_port=reuse_port)
         if self._started:
             self.add_sockets(sockets)
         else:
@@ -199,12 +229,30 @@ class TCPServer(object):
         Requests currently in progress may still continue after the
         server is stopped.
         """
+        if self._stopped:
+            return
+        self._stopped = True
         for fd, sock in self._sockets.items():
-            self.io_loop.remove_handler(fd)
+            assert sock.fileno() == fd
+            # Unregister socket from IOLoop
+            self._handlers.pop(fd)()
             sock.close()
 
     def handle_stream(self, stream, address):
-        """Override to handle a new `.IOStream` from an incoming connection."""
+        """Override to handle a new `.IOStream` from an incoming connection.
+
+        This method may be a coroutine; if so any exceptions it raises
+        asynchronously will be logged. Accepting of incoming connections
+        will not be blocked by this coroutine.
+
+        If this `TCPServer` is configured for SSL, ``handle_stream``
+        may be called before the SSL handshake has completed. Use
+        `.SSLIOStream.wait_for_handshake` if you need to verify the client's
+        certificate or use NPN/ALPN.
+
+        .. versionchanged:: 4.2
+           Added the option for this method to be a coroutine.
+        """
         raise NotImplementedError()
 
     def _handle_connection(self, connection, address):
@@ -230,16 +278,24 @@ class TCPServer(object):
                 # catch another error later on (AttributeError in
                 # SSLIOStream._do_ssl_handshake).
                 # To test this behavior, try nmap with the -sT flag.
-                # https://github.com/facebook/tornado/pull/750
-                if err.args[0] in (errno.ECONNABORTED, errno.EINVAL):
+                # https://github.com/tornadoweb/tornado/pull/750
+                if errno_from_exception(err) in (errno.ECONNABORTED, errno.EINVAL):
                     return connection.close()
                 else:
                     raise
         try:
             if self.ssl_options is not None:
-                stream = SSLIOStream(connection, io_loop=self.io_loop, max_buffer_size=self.max_buffer_size)
+                stream = SSLIOStream(connection,
+                                     max_buffer_size=self.max_buffer_size,
+                                     read_chunk_size=self.read_chunk_size)
             else:
-                stream = IOStream(connection, io_loop=self.io_loop, max_buffer_size=self.max_buffer_size)
-            self.handle_stream(stream, address)
+                stream = IOStream(connection,
+                                  max_buffer_size=self.max_buffer_size,
+                                  read_chunk_size=self.read_chunk_size)
+
+            future = self.handle_stream(stream, address)
+            if future is not None:
+                IOLoop.current().add_future(gen.convert_yielded(future),
+                                            lambda f: f.result())
         except Exception:
             app_log.error("Error in connection callback", exc_info=True)

@@ -32,7 +32,7 @@ New modules
 `tornado.concurrent`
 ~~~~~~~~~~~~~~~~~~~~
 
-* `.TracebackFuture` now accepts a ``timeout`` keyword argument (although
+* ``TracebackFuture`` now accepts a ``timeout`` keyword argument (although
   it is still incorrect to use a non-zero timeout in non-blocking code).
 
 ``tornado.curl_httpclient``
@@ -156,7 +156,7 @@ New modules
   individual aspects of debug mode.
 * New methods `.RequestHandler.get_query_argument` and
   `.RequestHandler.get_body_argument` and new attributes
-  `.HTTPRequest.query_arguments` and `.HTTPRequest.body_arguments` allow access
+  ``HTTPRequest.query_arguments`` and ``HTTPRequest.body_arguments`` allow access
   to arguments without intermingling those from the query string with those
   from the request body.
 * `.RequestHandler.decode_argument` and related methods now raise
@@ -164,11 +164,11 @@ New modules
   argument could not be decoded.
 * `.RequestHandler.clear_all_cookies` now accepts ``domain`` and ``path``
   arguments, just like `~.RequestHandler.clear_cookie`.
-* It is now possible to specify handlers by name when using the `.URLSpec`
-  class.
+* It is now possible to specify handlers by name when using the
+  `tornado.web.URLSpec` class.
 * `.Application` now accepts 4-tuples to specify the ``name`` parameter
-  (which previously required constructing a `.URLSpec` object instead of
-  a tuple).
+  (which previously required constructing a `tornado.web.URLSpec` object
+  instead of a tuple).
 * Fixed an incorrect error message when handler methods return a value
   other than None or a Future.
 * Exceptions will no longer be logged twice when using both ``@asynchronous``

@@ -16,7 +16,7 @@
 
 """The Tornado web server and tools."""
 
-from __future__ import absolute_import, division, print_function, with_statement
+from __future__ import absolute_import, division, print_function
 
 # version is a human-readable version number.
 
@@ -25,5 +25,5 @@ from __future__ import absolute_import, division, print_function, with_statement
 # is zero for an official release, positive for a development branch,
 # or negative for a release candidate or beta (after the base version
 # number has been incremented)
-version = "3.3.dev1"
-version_info = (3, 3, 0, -100)
+version = "5.0a1"
+version_info = (5, 0, 0, -99)

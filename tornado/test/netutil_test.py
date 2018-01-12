@@ -1,16 +1,19 @@
-from __future__ import absolute_import, division, print_function, with_statement
+from __future__ import absolute_import, division, print_function
 
-import platform
+import errno
+import os
 import signal
 import socket
 from subprocess import Popen
 import sys
 import time
 
-from tornado.netutil import BlockingResolver, ThreadedResolver, is_valid_ip, bind_sockets
+from tornado.netutil import (
+    BlockingResolver, OverrideResolver, ThreadedResolver, is_valid_ip, bind_sockets
+)
 from tornado.stack_context import ExceptionStackContext
-from tornado.testing import AsyncTestCase, gen_test
-from tornado.test.util import unittest
+from tornado.testing import AsyncTestCase, gen_test, bind_unused_port
+from tornado.test.util import unittest, skipIfNoNetwork
 
 try:
     from concurrent import futures
@@ -18,14 +21,15 @@ except ImportError:
     futures = None
 
 try:
-    import pycares
+    import pycares  # type: ignore
 except ImportError:
     pycares = None
 else:
     from tornado.platform.caresresolver import CaresResolver
 
 try:
-    import twisted
+    import twisted  # type: ignore
+    import twisted.names  # type: ignore
 except ImportError:
     twisted = None
 else:
@@ -33,15 +37,6 @@ else:
 
 
 class _ResolverTestMixin(object):
-    def skipOnCares(self):
-        # Some DNS-hijacking ISPs (e.g. Time Warner) return non-empty results
-        # with an NXDOMAIN status code.  Most resolvers treat this as an error;
-        # C-ares returns the results, making the "bad_host" tests unreliable.
-        # C-ares will try to resolve even malformed names, such as the
-        # name with spaces used in this test.
-        if self.resolver.__class__.__name__ == 'CaresResolver':
-            self.skipTest("CaresResolver doesn't recognize fake NXDOMAIN")
-
     def test_localhost(self):
         self.resolver.resolve('localhost', 80, callback=self.stop)
         result = self.wait()
@@ -54,8 +49,11 @@ class _ResolverTestMixin(object):
         self.assertIn((socket.AF_INET, ('127.0.0.1', 80)),
                       addrinfo)
 
+
+# It is impossible to quickly and consistently generate an error in name
+# resolution, so test this case separately, using mocks as needed.
+class _ResolverErrorTestMixin(object):
     def test_bad_host(self):
-        self.skipOnCares()
         def handler(exc_typ, exc_val, exc_tb):
             self.stop(exc_val)
             return True  # Halt propagation.
@@ -68,30 +66,85 @@ class _ResolverTestMixin(object):
 
     @gen_test
     def test_future_interface_bad_host(self):
-        self.skipOnCares()
-        with self.assertRaises(Exception):
+        with self.assertRaises(IOError):
             yield self.resolver.resolve('an invalid domain', 80,
                                         socket.AF_UNSPEC)
 
 
+def _failing_getaddrinfo(*args):
+    """Dummy implementation of getaddrinfo for use in mocks"""
+    raise socket.gaierror(errno.EIO, "mock: lookup failed")
+
+
+@skipIfNoNetwork
 class BlockingResolverTest(AsyncTestCase, _ResolverTestMixin):
     def setUp(self):
         super(BlockingResolverTest, self).setUp()
-        self.resolver = BlockingResolver(io_loop=self.io_loop)
+        self.resolver = BlockingResolver()
 
 
+# getaddrinfo-based tests need mocking to reliably generate errors;
+# some configurations are slow to produce errors and take longer than
+# our default timeout.
+class BlockingResolverErrorTest(AsyncTestCase, _ResolverErrorTestMixin):
+    def setUp(self):
+        super(BlockingResolverErrorTest, self).setUp()
+        self.resolver = BlockingResolver()
+        self.real_getaddrinfo = socket.getaddrinfo
+        socket.getaddrinfo = _failing_getaddrinfo
+
+    def tearDown(self):
+        socket.getaddrinfo = self.real_getaddrinfo
+        super(BlockingResolverErrorTest, self).tearDown()
+
+
+class OverrideResolverTest(AsyncTestCase, _ResolverTestMixin):
+    def setUp(self):
+        super(OverrideResolverTest, self).setUp()
+        mapping = {
+            ('google.com', 80): ('1.2.3.4', 80),
+            ('google.com', 80, socket.AF_INET): ('1.2.3.4', 80),
+            ('google.com', 80, socket.AF_INET6): ('2a02:6b8:7c:40c:c51e:495f:e23a:3', 80)
+        }
+        self.resolver = OverrideResolver(BlockingResolver(), mapping)
+
+    def test_resolve_multiaddr(self):
+        self.resolver.resolve('google.com', 80, socket.AF_INET, callback=self.stop)
+        result = self.wait()
+        self.assertIn((socket.AF_INET, ('1.2.3.4', 80)), result)
+
+        self.resolver.resolve('google.com', 80, socket.AF_INET6, callback=self.stop)
+        result = self.wait()
+        self.assertIn((socket.AF_INET6, ('2a02:6b8:7c:40c:c51e:495f:e23a:3', 80, 0, 0)), result)
+
+
+@skipIfNoNetwork
 @unittest.skipIf(futures is None, "futures module not present")
 class ThreadedResolverTest(AsyncTestCase, _ResolverTestMixin):
     def setUp(self):
         super(ThreadedResolverTest, self).setUp()
-        self.resolver = ThreadedResolver(io_loop=self.io_loop)
+        self.resolver = ThreadedResolver()
 
     def tearDown(self):
         self.resolver.close()
         super(ThreadedResolverTest, self).tearDown()
 
 
+class ThreadedResolverErrorTest(AsyncTestCase, _ResolverErrorTestMixin):
+    def setUp(self):
+        super(ThreadedResolverErrorTest, self).setUp()
+        self.resolver = BlockingResolver()
+        self.real_getaddrinfo = socket.getaddrinfo
+        socket.getaddrinfo = _failing_getaddrinfo
+
+    def tearDown(self):
+        socket.getaddrinfo = self.real_getaddrinfo
+        super(ThreadedResolverErrorTest, self).tearDown()
+
+
+@skipIfNoNetwork
 @unittest.skipIf(futures is None, "futures module not present")
+@unittest.skipIf(sys.platform == 'win32', "preexec_fn not available on win32")
 class ThreadedResolverImportTest(unittest.TestCase):
     def test_import(self):
         TIMEOUT = 5
@@ -116,19 +169,30 @@ class ThreadedResolverImportTest(unittest.TestCase):
         self.fail("import timed out")
 
 
+# We do not test errors with CaresResolver:
+# Some DNS-hijacking ISPs (e.g. Time Warner) return non-empty results
+# with an NXDOMAIN status code.  Most resolvers treat this as an error;
+# C-ares returns the results, making the "bad_host" tests unreliable.
+# C-ares will try to resolve even malformed names, such as the
+# name with spaces used in this test.
+@skipIfNoNetwork
 @unittest.skipIf(pycares is None, "pycares module not present")
 class CaresResolverTest(AsyncTestCase, _ResolverTestMixin):
     def setUp(self):
         super(CaresResolverTest, self).setUp()
-        self.resolver = CaresResolver(io_loop=self.io_loop)
+        self.resolver = CaresResolver()
 
 
+# TwistedResolver produces consistent errors in our test cases so we
+# can test the regular and error cases in the same class.
+@skipIfNoNetwork
 @unittest.skipIf(twisted is None, "twisted module not present")
 @unittest.skipIf(getattr(twisted, '__version__', '0.0') < "12.1", "old version of twisted")
-class TwistedResolverTest(AsyncTestCase, _ResolverTestMixin):
+class TwistedResolverTest(AsyncTestCase, _ResolverTestMixin,
+                          _ResolverErrorTestMixin):
     def setUp(self):
         super(TwistedResolverTest, self).setUp()
-        self.resolver = TwistedResolver(io_loop=self.io_loop)
+        self.resolver = TwistedResolver()
 
 
 class IsValidIPTest(unittest.TestCase):
@@ -147,15 +211,27 @@ class IsValidIPTest(unittest.TestCase):
         self.assertTrue(not is_valid_ip('\x00'))
 
 
-# The mac firewall prompts when listening on "localhost" instead of
-# "127.0.0.1" like the other tests use (maybe due to the ipv6
-# link-local address fe80::1%lo0?), and it doesn't remember whether
-# you've previously allowed or denied access.  It's better to skip this
-# test on the mac than to have the prompts come up for every configuration
-# in tox.ini.
-@unittest.skipIf(platform.system() == 'Darwin', 'avoid firewall prompts on Mac')
 class TestPortAllocation(unittest.TestCase):
     def test_same_port_allocation(self):
+        if 'TRAVIS' in os.environ:
+            self.skipTest("dual-stack servers often have port conflicts on travis")
         sockets = bind_sockets(None, 'localhost')
-        port = sockets[0].getsockname()[1]
-        self.assertTrue(all(s.getsockname()[1] == port for s in sockets[1:]))
+        try:
+            port = sockets[0].getsockname()[1]
+            self.assertTrue(all(s.getsockname()[1] == port
+                                for s in sockets[1:]))
+        finally:
+            for sock in sockets:
+                sock.close()
+
+    @unittest.skipIf(not hasattr(socket, "SO_REUSEPORT"), "SO_REUSEPORT is not supported")
+    def test_reuse_port(self):
+        sockets = []
+        socket, port = bind_unused_port(reuse_port=True)
+        try:
+            sockets = bind_sockets(port, '127.0.0.1', reuse_port=True)
+            self.assertTrue(all(s.getsockname()[1] == port for s in sockets))
+        finally:
+            socket.close()
+            for sock in sockets:
+                sock.close()

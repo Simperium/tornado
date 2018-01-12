@@ -16,6 +16,7 @@
 
 import os
 import platform
+import ssl
 import sys
 import warnings
 
@@ -34,15 +35,7 @@ from distutils.core import Extension
 # to support installing without the extension on platforms where
 # no compiler is available.
 from distutils.command.build_ext import build_ext
-from distutils.errors import CCompilerError
-from distutils.errors import DistutilsPlatformError, DistutilsExecError
-if sys.platform == 'win32' and sys.version_info > (2, 6):
-    # 2.6's distutils.msvc9compiler can raise an IOError when failing to
-    # find the compiler
-    build_errors = (CCompilerError, DistutilsExecError,
-                    DistutilsPlatformError, IOError)
-else:
-    build_errors = (CCompilerError, DistutilsExecError, DistutilsPlatformError)
+
 
 class custom_build_ext(build_ext):
     """Allow C extension building to fail.
@@ -68,9 +61,13 @@ Debian and Ubuntu users should issue the following command:
 
     $ sudo apt-get install build-essential python-dev
 
-RedHat, CentOS, and Fedora users should issue the following command:
+RedHat and CentOS users should issue the following command:
 
     $ sudo yum install gcc python-devel
+
+Fedora users should issue the following command:
+
+    $ sudo dnf install gcc python-devel
 
 If you are seeing this message on OSX please read the documentation
 here:
@@ -82,7 +79,7 @@ http://api.mongodb.org/python/current/installation.html#osx
     def run(self):
         try:
             build_ext.run(self)
-        except DistutilsPlatformError:
+        except Exception:
             e = sys.exc_info()[1]
             sys.stdout.write('%s\n' % str(e))
             warnings.warn(self.warning_message % ("Extension modules",
@@ -92,35 +89,28 @@ http://api.mongodb.org/python/current/installation.html#osx
 
     def build_extension(self, ext):
         name = ext.name
-        if sys.version_info[:3] >= (2, 4, 0):
-            try:
-                build_ext.build_extension(self, ext)
-            except build_errors:
-                e = sys.exc_info()[1]
-                sys.stdout.write('%s\n' % str(e))
-                warnings.warn(self.warning_message % ("The %s extension "
-                                                      "module" % (name,),
-                                                      "The output above "
-                                                      "this warning shows how "
-                                                      "the compilation "
-                                                      "failed."))
-        else:
+        try:
+            build_ext.build_extension(self, ext)
+        except Exception:
+            e = sys.exc_info()[1]
+            sys.stdout.write('%s\n' % str(e))
             warnings.warn(self.warning_message % ("The %s extension "
                                                   "module" % (name,),
-                                                  "Please use Python >= 2.4 "
-                                                  "to take advantage of the "
-                                                  "extension."))
+                                                  "The output above "
+                                                  "this warning shows how "
+                                                  "the compilation "
+                                                  "failed."))
 
 
 kwargs = {}
 
-version = "3.3.dev1"
+version = "5.0a1"
 
 with open('README.rst') as f:
     kwargs['long_description'] = f.read()
 
 if (platform.python_implementation() == 'CPython' and
-    os.environ.get('TORNADO_EXTENSION') != '0'):
+        os.environ.get('TORNADO_EXTENSION') != '0'):
     # This extension builds and works on pypy as well, although pypy's jit
     # produces equivalent performance.
     kwargs['ext_modules'] = [
@@ -133,17 +123,36 @@ if (platform.python_implementation() == 'CPython' and
         # fall back to the pure-python implementation on any build failure.
         kwargs['cmdclass'] = {'build_ext': custom_build_ext}
 
+
 if setuptools is not None:
     # If setuptools is not available, you're on your own for dependencies.
+    install_requires = []
     if sys.version_info < (3, 2):
-        kwargs['install_requires'] = ['backports.ssl_match_hostname']
+        install_requires.append('futures')
+    if sys.version_info < (3, 4):
+        install_requires.append('singledispatch')
+    if sys.version_info < (3, 5):
+        install_requires.append('backports_abc>=0.4')
+    kwargs['install_requires'] = install_requires
+
+    python_requires = '>= 2.7, !=3.0.*, !=3.1.*, !=3.2.*, != 3.3.*'
+    kwargs['python_requires'] = python_requires
+
+# Verify that the SSL module has all the modern upgrades. Check for several
+# names individually since they were introduced at different versions,
+# although they should all be present by Python 3.4 or 2.7.9.
+if (not hasattr(ssl, 'SSLContext') or
+        not hasattr(ssl, 'create_default_context') or
+        not hasattr(ssl, 'match_hostname')):
+    raise ImportError("Tornado requires an up-to-date SSL module. This means "
+                      "Python 2.7.9+ or 3.4+ (although some distributions have "
+                      "backported the necessary changes to older versions).")
 
 setup(
     name="tornado",
     version=version,
-    packages = ["tornado", "tornado.test", "tornado.platform"],
-    package_data = {
-        "tornado": ["ca-certificates.crt"],
+    packages=["tornado", "tornado.test", "tornado.platform"],
+    package_data={
         # data files need to be listed both here (which determines what gets
         # installed) and in MANIFEST.in (which determines what gets included
         # in the sdist tarball)
@@ -154,28 +163,32 @@ setup(
             "gettext_translations/fr_FR/LC_MESSAGES/tornado_test.po",
             "options_test.cfg",
             "static/robots.txt",
+            "static/sample.xml",
+            "static/sample.xml.gz",
+            "static/sample.xml.bz2",
             "static/dir/index.html",
+            "static_foo.txt",
             "templates/utf8.html",
             "test.crt",
             "test.key",
-            ],
-        },
+        ],
+    },
     author="Facebook",
     author_email="python-tornado@googlegroups.com",
     url="http://www.tornadoweb.org/",
     license="http://www.apache.org/licenses/LICENSE-2.0",
-    description="Tornado is a Python web framework and asynchronous networking library, originally developed at FriendFeed.",
+    description=("Tornado is a Python web framework and asynchronous networking library,"
+                 " originally developed at FriendFeed."),
     classifiers=[
         'License :: OSI Approved :: Apache Software License',
         'Programming Language :: Python :: 2',
-        'Programming Language :: Python :: 2.6',
         'Programming Language :: Python :: 2.7',
         'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.2',
-        'Programming Language :: Python :: 3.3',
         'Programming Language :: Python :: 3.4',
+        'Programming Language :: Python :: 3.5',
+        'Programming Language :: Python :: 3.6',
         'Programming Language :: Python :: Implementation :: CPython',
         'Programming Language :: Python :: Implementation :: PyPy',
-        ],
+    ],
     **kwargs
 )
