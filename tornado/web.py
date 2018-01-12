@@ -2050,7 +2050,6 @@ class Application(ReversibleRouter):
         """
         return _HandlerDelegate(
             self, request, target_class, target_kwargs, path_args, path_kwargs)
->>>>>>> upstream-master
 
     def reverse_url(self, name, *args):
         """Returns a URL path for handler named ``name``
