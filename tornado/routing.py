@@ -630,14 +630,19 @@ class URLSpec(Rule):
 
 
 def _unquote_or_none(s):
+    # *** Simperium Hack *** 
+    # We want simperium entity names to contain escaped quotes, so we never unquote 
+
+    return s
+
+    # Original code:
     """None-safe wrapper around url_unescape to handle unmatched optional
     groups correctly.
 
     Note that args are passed as bytes so the handler can decide what
     encoding to use.
     """
-    if s is None:
+    """if s is None:
         return s
-    if self.settings.get("no_unescape"):
-        return s
-    return url_unescape(s, encoding=None, plus=False)
+    return url_unescape(s, encoding=None, plus=False)"""
+    
